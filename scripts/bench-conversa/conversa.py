@@ -36,7 +36,7 @@ def post(porta, rota, corpo, timeout=1800):
 def turnos():
     """Pares (usuário, assistente) com trechos dos docs do repositório."""
     texto = ""
-    for p in sorted(glob.glob("/home/murilo/llama.rs/docs/*.md")) + sorted(glob.glob("/home/murilo/llama.rs/docs/planos/*.md")):
+    for p in sorted(glob.glob("/home/murilo/llama.rs-MI50/docs/*.md")) + sorted(glob.glob("/home/murilo/llama.rs-MI50/docs/planos/*.md")):
         texto += open(p).read() + "\n\n"
     pedacos = [texto[i:i + 4500] for i in range(0, len(texto), 4500)]
     out = []

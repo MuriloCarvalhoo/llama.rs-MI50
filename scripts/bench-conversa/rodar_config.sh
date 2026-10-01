@@ -4,7 +4,7 @@
 # Precisa de: servidor ouvindo em 127.0.0.1:<porta>, conversas.json calibrado (conversa.py calibrar).
 # Uso: rodar_config.sh <rotulo> <motor: llamars|llamacpp> <porta> <pstate_externo: nenhum|standard> <profundidades> -- <comando do servidor...>
 set -uo pipefail
-cd /home/murilo/llama.rs
+cd /home/murilo/llama.rs-MI50
 S="$(cd "$(dirname "$0")" && pwd)"
 O="${BENCH_SAIDA:-/tmp/bench-conversa}"
 mkdir -p "$O"
