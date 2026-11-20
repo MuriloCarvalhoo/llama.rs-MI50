@@ -12,7 +12,7 @@ e como desfazer.
   revisados: (A) servidor — 4.2, 4.3, 4.5; (B) 4.1, 3.3, 4.4 (este último só compilado no agente;
   a verificação com a GPU é feita depois no `master`).
 - **3.1 (refrigeração da card1) não é executado**: pede root (`pwm1`/`power1_cap`) e é decisão de
-  hardware do usuário. Fica anotado com a recomendação no fim deste arquivo.
+  hardware do usuário.
 
 ## Agente principal
 
@@ -124,6 +124,7 @@ e como desfazer.
       token. Com a card1 no clock da outra, o decode ganharia ~25% — é o **3.1**, e ele é o
       maior ganho que sobrou. Não tirei o `min_sclk` da escada: sem ele a card1 chegou a
       103 °C.
+      > **Atualização 2026-11-20:** com o undervolt da card1 ela chega a 89 °C em `standard` e 96 °C em `peak`, e o `peak` dá o mesmo decode que o `standard`; o 3.1 não é mais o maior ganho.
     - **O matvec Q4_K acompanha o clock do núcleo** (bancada: 380–430 GB/s em `min_sclk`,
       564–621 em `standard`). Não é a soma de `x` do termo do `dmin`: zerá-la (como faz o
       `q8_1` do llama.cpp, que guarda a soma pronta) não mudou nada. O 2.2 continua aberto,
@@ -148,8 +149,11 @@ e como desfazer.
     não passa de 78 °C (crit 94). Não houve ganho mensurável ao subir o limiar (prefill de
     272 para 269 s): perto de 100 °C o próprio firmware já baixa a card1 para 1425 MHz. Os
     ~20 °C de diferença entre as duas placas com a mesma carga são refrigeração da card1.
+    > **Atualização 2026-11-20:** depois do undervolt a card1 não passa de 89 °C em `standard` e 96 °C em `peak`.
 
 ## Agente A — robustez do servidor (itens 4.2, 4.3 e 4.5)
+
+> **Atualização 2026-11-20:** os itens 1 e 2 abaixo foram revertidos pela decisão 4: `model` diferente é atendido e `max_tokens: -1` vale como "sem limite".
 
 1. **`model` estrito, com o campo ausente aceito.** Vale `model` vazio/ausente ou igual ao
    `--nome` sem diferenciar maiúsculas; qualquer outro nome é 404 `model_not_found` (formato da

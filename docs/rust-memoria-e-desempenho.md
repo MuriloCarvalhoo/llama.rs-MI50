@@ -16,7 +16,7 @@ Documento derivado de pesquisa com fontes. Onde não há medição publicada, es
 | `parking_lot` em vez de `std::sync::Mutex`? | **Não.** `std` é futex-based desde 1.62 e nossa contenção é ~zero. |
 | `crossbeam` para canais? | **Já temos.** `std::sync::mpsc` **é** crossbeam vendorizado desde Rust 1.67. |
 | `std::simd`? | **Indisponível** (nightly). Usar `std::arch` (safe desde 1.87) se o profiler pedir. |
-| O que dá mais desempenho por esforço? | Eliminar `queue_wait_idle`; `[profile.release]` com LTO. |
+| O que dá mais desempenho por esforço? | Eliminar `queue_wait_idle`; `[profile.release]` com LTO — os dois já aplicados no caminho de produção. |
 | O que dá mais economia de memória? | Não copiar os pesos — emprestar do mmap. |
 
 ---
@@ -35,8 +35,8 @@ Carregando Qwen2.5-14B Q8_0 (14.6 GiB) com `--gpu-resident`, **antes** das corre
 | `token_embd.dequant_to_f32()` (cache f32 = 4× o Q8_0) | 3.11 GB | Só 1 linha por token |
 | `GpuRawWeights` → `raw.to_vec()` | 14.6 GB | Não — a GPU lê do mmap |
 
-Resultado: OOM kill em máquina de 62 GB **sem swap**. Todas as fontes acima foram corrigidas
-(ver `PROGRESS.md`), e o 14B passou a carregar e gerar texto.
+Resultado: OOM kill em máquina de 62 GB **sem swap**. Todas as fontes acima foram corrigidas,
+e o 14B passou a carregar e gerar texto.
 
 **Lição transferível:** num pipeline de inferência, o inimigo não é o tamanho do modelo — é o
 **número de imagens do modelo** que existem simultaneamente na RAM.
@@ -245,15 +245,15 @@ Regras com número medido:
 - **Timeline semaphores** (core em 1.2, suportado em AMD) são superset de fence+semaphore, com
   granularidade mais fina e sem exigir sincronização externa do objeto.
 
-> **Aplicação direta:** este projeto tem `queue_wait_idle` em quase todos os caminhos de submissão
-> (`matmul.rs`, `resident.rs`, `resident_forward.rs`). É o anti-padrão exato que a Khronos mede
-> como 22% pior. Só o laço de token já usa `wait_for_fences`.
+> **Aplicação direta:** o decode e o prefill do `resident_forward.rs` esperam por fence
+> (`espera_fence`). O `queue_wait_idle` — o anti-padrão que a Khronos mede como 22% pior — sobra
+> nos caminhos antigos (`matmul.rs`, `resident.rs`), no `dispatch_xyz` e na destruição.
 
 ### 2.5 SIMD
 
 **`std::simd` continua nightly em 2026** — a meta de estabilização não foi renovada para 2026
 ([project goals, abr/2026](https://blog.rust-lang.org/2026/05/18/project-goals-2026-04/)). O
-toolchain aqui está pinado em **stable 1.96.0**, então está fora.
+toolchain aqui está pinado em **stable 1.98.0**, então está fora.
 
 Novidade relevante: **desde Rust 1.87 a maioria dos intrinsics de `std::arch` é chamável de código
 safe** quando as target features estão habilitadas em tempo de compilação. Como o projeto já compila
@@ -266,8 +266,8 @@ runtime, base do `faer`). **Não há benchmark publicado comparando pulp/wide/au
 
 ### 2.6 Flags de build
 
-Estado atual: `target-cpu=native` ✅, mas **nenhum `[profile.release]`** → sem LTO,
-`codegen-units=16`, `panic=unwind`.
+Estado atual: `target-cpu=native` ✅ e `[profile.release]` com `lto = "thin"` e
+`codegen-units = 1` ✅; `panic=unwind` fica (o `abort` quebra os `#[should_panic]`).
 
 | Flag | Ganho medido | Fonte |
 |---|---|---|
@@ -293,9 +293,9 @@ Atenção: há bug histórico de hang com `lto=true` + `target-cpu=native`
 | 1 | Não construir `Weights` de CPU no caminho GPU | ~15 GB RSS | Baixo | ✅ feito (repack preguiçoso + `RawTensor<'a>`) |
 | 2 | `GpuRawWeights` emprestar do mmap | 14.6 GB | Baixo | ✅ feito |
 | 3 | `token_embd` fora da VRAM | 3.1 GB VRAM | Baixo | ✅ feito |
-| 4 | **Eliminar `queue_wait_idle`** (usar fences/timeline) | **~22% (medido pela Khronos)** | Médio | ⬜ pendente |
-| 5 | `[profile.release]`: `lto="thin"`, `codegen-units=1` | 3–20% | Trivial | ⬜ pendente |
-| 6 | `MmapOptions::populate()` + `Advice::Sequential` | Load mais rápido | Trivial | ✅ feito (`map_model`; efeito pendente de medição) |
+| 4 | **Eliminar `queue_wait_idle`** (usar fences/timeline) | **~22% (medido pela Khronos)** | Médio | ✅ no decode e no prefill (`espera_fence`); sobra nos caminhos antigos |
+| 5 | `[profile.release]`: `lto="thin"`, `codegen-units=1` | 3–20% | Trivial | ✅ feito |
+| 6 | `MmapOptions::populate()` + `Advice::Sequential` | Load mais rápido | Trivial | ✅ feito (`map_model`; carga quente medida em 4,5–5,0 s) |
 | 7 | 2 threads persistentes (1/GPU) em vez de `rayon::join` | Latência determinística | Médio | ⬜ pendente |
 | 8 | `token_embd` sem materializar f32 (dequant de 1 linha) | 6.2 GB RAM | Médio | ✅ feito (`llama_model::TokenEmbd`) |
 | 9 | Upload em chunks + `posix_fadvise(DONTNEED)` | Pico de page cache | Médio | 🟡 chunks feitos (staging duplo de 256 MB); **sem** `fadvise` |
@@ -325,4 +325,4 @@ Declarado para evitar que alguém trate estimativa como medição:
 - Comparação numérica pulp / wide / autovetorização.
 - Modelo de threading multi-GPU do `burn` ou do `candle` (sem documentação autoritativa).
 
-Os benchmarks acima só podem ser feitos aqui — o repo já tem `bench-results/` para isso.
+Os benchmarks acima só podem ser feitos aqui.

@@ -2,8 +2,9 @@
 
 ## O problema
 
-`gerar_streaming_residente` (`crates/llama-model/src/gpu.rs`) processa o prompt um token
-por vez:
+*Histórico: hoje o prompt vai em blocos (`prefill_residente` em `crates/llama-model/src/gpu.rs`);
+as atualizações no fim da seção do GEMM têm o estado atual.* Antes do batch,
+`gerar_streaming_residente` processava o prompt um token por vez:
 
 ```rust
 for (pos, &t) in prompt_ids.iter().enumerate() {
@@ -12,7 +13,7 @@ for (pos, &t) in prompt_ids.iter().enumerate() {
 ```
 
 Cada token dispara um forward completo, que lê **os 19,5 GB de pesos inteiros**. Um prompt
-de 500 tokens custa 500 × 19,5 GB = 9,75 TB, ou ~25 s a 717 GB/s divididos entre as duas
+de 500 tokens custa 500 × 19,5 GB = 9,75 TB, ou ~25 s a 717 GB/s (o teto medido hoje é 836) divididos entre as duas
 GPUs. É a diferença entre um protótipo e algo usável com contexto real, e não aparece em
 nenhum número de tok/s de decode — que medimos sempre com prompt curto.
 
@@ -24,7 +25,7 @@ O llama.cpp tem dois caminhos para a mesma multiplicação:
 | prefill | `mul_mm.comp` | N tokens — GEMM com tiling em LDS, lê o peso **uma vez** para os N |
 
 Com N tokens em batch o kernel passa a ser compute-bound, e a MI50 tem folga de sobra ali:
-~52 TOPS int8 com `V_DOT4_I32_I8` contra os 717 GB/s de banda.
+~51 TOPS int8 com `V_DOT4_I32_I8` contra os 836 GB/s de banda (tetos medidos).
 
 ## O desenho, em duas etapas
 
@@ -56,21 +57,22 @@ que dimensionava os acumuladores por uma constante fixa (`MAX_COLS = 8`) em vez 
 `COLS`, e com 16 colunas escrevia fora do array. Com isso resolvido o teto de
 `LLAMA_RS_BATCH` é 32, e **onde a curva vira é empírico**: `ROWS_PER_WAVE × COLS`
 acumuladores vivos por lane, e em algum ponto a ocupância cai mais do que o reuso do peso
-rende. O padrão continua 8, que é o valor medido.
+rende. O padrão hoje é 256 quando o modelo é todo Q4_K/Q5_K/Q6_K e 32 no resto (ver o fim
+da seção do GEMM).
 
 ### Etapa 2 — GEMM com tiling em LDS
 
-Implementado em `shaders/mul_mm.comp`, **desligado por padrão**
-(`LLAMA_RS_PREFILL_GEMM=1` liga). Só Q4_K, que é 53% do tempo de matvec no Qwen3.8-27B; os
-demais tipos seguem na etapa 1.
+Implementado em `shaders/mul_mm.comp` (e `mul_mm_q4k.comp`), **ligado por padrão**
+(`LLAMA_RS_PREFILL_GEMM=0` desliga). Cobre Q4_K e Q5_K; o Q6_K só acima de 32 colunas ou com
+`LLAMA_RS_GEMM_Q6K=1`; os demais tipos seguem na etapa 1.
 
 O que muda em relação ao matvec-COLS: o reuso sai do registrador e vai para a LDS. Tile de
 **128 linhas × COLS colunas × 32 elementos de K**, workgroup de 256 threads como grade
 32×8, cada thread com 4 linhas × COLS/8 colunas — intensidade `TM·TN/(TM+TN)` = 2 com
 COLS=32. `dotPacked4x8AccSatEXT` no laço interno, que é onde a MI50 tem folga no prefill
-(~52 TOPS de int8 contra 717 GB/s).
+(~51 TOPS de int8 contra 836 GB/s).
 
-`BK = 32` não é escolha livre: é o sub-bloco de quantização do Q4_K **e** o bloco do
+`BK = 32` não é escolha livre no `mul_mm.comp` (o Q4_K passou a K = 64 no `mul_mm_q4k.comp`, ver abaixo): é o sub-bloco de quantização do Q4_K **e** o bloco do
 `quantize_x`, então cada passo de K tem exatamente uma escala de cada lado. O termo afim do
 Q4_K (`-dmin·m·soma(x)`) sobrevive ao tiling porque `soma(x)` só depende da coluna — sai
 uma vez por (coluna, passo de K) para a LDS.
@@ -173,5 +175,5 @@ O prefill não amostra: só o **último** token do prompt precisa de logits. A p
 
 Um segundo plano, irmão de `build_plan`, dimensionado para `n_batch` tokens, com os mesmos
 pesos residentes e buffers de ativação `n_batch` vezes maiores. O prompt é consumido em
-blocos de `n_batch`; o resto (`< n_batch` tokens) cai no caminho token-a-token que já
-existe, que continua sendo o caminho do decode.
+blocos de `n_batch`; o resto (`< n_batch` tokens) vai em blocos de 32 (`batch_resto`) e só
+o que sobra disso cai no caminho token-a-token, que continua sendo o caminho do decode.

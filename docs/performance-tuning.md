@@ -54,7 +54,7 @@ por uma sequência de decisões que só fazem sentido olhando o que foi medido:
   lane emitia 17 requests de 4 bytes por superbloco; em `uvec4` são 5 requests de 16 bytes — os
   mesmos bytes totais, com 3.4× menos requests ao cache L1. O kernel não era limitado pelos bytes
   em si (o L2 já deduplicava a redundância entre lanes vizinhas), era limitado pela **taxa de
-  requests**: medimos 465 GB/s efetivos contra um teto de 717 GB/s de pico nesta arquitetura.
+  requests**: medimos 465 GB/s efetivos contra um teto medido de 836 GB/s nesta placa.
 - **Reduzir a redundância entre lanes (em vez dos requests) foi medido 4% mais lento.** A
   alternativa óbvia — uma lane por par de sub-blocos que compartilha os mesmos bytes de `qs`, 4
   lanes por superbloco em vez de 8 — deixa 16 das 64 lanes ociosas na última rodada de um kernel

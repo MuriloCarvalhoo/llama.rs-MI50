@@ -4,7 +4,8 @@
 
 | GPU | Arquitetura | VRAM | API |
 |---|---|---|---|
-| AMD MI50 / MI60 / Radeon Pro VII | GCN 5.1 / gfx906 | 16 GB HBM2 | Vulkan 1.1+ |
+| AMD MI50 / Radeon Pro VII | GCN 5.1 / gfx906 | 16 GB HBM2 | Vulkan 1.1+ |
+| AMD MI60 | GCN 5.1 / gfx906 | 32 GB HBM2 | Vulkan 1.1+ |
 
 O backend Vulkan usa subgroup ops de tamanho 64 (wave64) — necessário para o gfx906 e para
 qualquer outra GPU AMD GCN/CDNA com a mesma largura de wavefront. GPUs com wave32 (a maioria das
@@ -25,7 +26,7 @@ desenho atual, e sem ganho líquido óbvio para justificar uma segunda família 
 
 ## Limites de VRAM e o motivo do layer-split
 
-16 GB por GPU é o teto: modelos de 20–28 GiB (a faixa de vários modelos de ~27–32B em quantização
+16 GB por MI50 é o teto: modelos de 20–28 GiB (a faixa de vários modelos de ~27–32B em quantização
 K) não cabem numa placa só. O layer-split entre 2 GPUs existe por isso — não é sobre velocidade
 (não há troca de dados suficiente entre as GPUs para valer a pena tentar paralelizar o cálculo em
 si), é sobre destravar a capacidade.

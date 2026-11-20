@@ -7,8 +7,14 @@ passo é dominado por **ler os pesos** e ler os mesmos 16,38 GB serve para 1 ou 
 `tok/s = base × (1 + taxa de aceitação)`. A aceitação foi **medida: 60,9 %** (fator 1,61),
 o que torna o alvo de 50 tok/s alcançável — ver `docs/decode-por-configuracao.md`.
 
-**Estado:** fases A–E implementadas; `--mtp` liga o caminho no `llama-cli` (desligado por
-padrão). O que falta é medir — nenhum tok/s com MTP foi levantado ainda.
+**Estado:** fases A–E implementadas; `--mtp` liga o caminho no `llama-cli` e no
+`llama-server` (desligado por padrão). A cabeça propõe 2 tokens encadeados e o verify é de 3
+(`VERIFY_TOK = 3`). A especulação só roda com o KV-cache abaixo de 12k (`MTP_ATE`;
+`LLAMA_RS_MTP_ATE=N` muda, `0` = sempre): acima disso o verify perde para o decode simples.
+Uma escolha adaptativa por passo foi tentada e descartada — media o MTP com viés contra
+ele (decisão 11 de `planos/2026-09-26-decisoes-autonomas.md`). Medido em 2026-11-20 no
+Qwen3.8-27B Q4_K_M: 34,4 / 29,3 tok/s com MTP a 2k / 8k de contexto, contra 26,3 / 24,4
+sem; 2,20 tokens por passo em geração real greedy.
 
 ## Fluxo
 
@@ -24,7 +30,8 @@ verificação    forward_batch([t+1, t+2])               → logits de t+2 e de 
 
 O ganho vem da verificação: `forward_batch` de 2 tokens lê os pesos **uma vez**, então
 custa quase o mesmo que 1 token. É por isso que o batch é pré-requisito — sem ele o MTP só
-adiciona trabalho.
+adiciona trabalho. O fluxo acima é o de uma proposta; em produção a cabeça roda de novo
+sobre a própria previsão e o verify cobre `[t+1, t+2, t+3]`.
 
 ## Fase A — carregar o bloco (PRONTA)
 
@@ -116,64 +123,61 @@ com `n = attn_dim × n_tok`, o `h = i / head_dim` do shader avança
 sozinho para `t * n_head + hh`, e `b_q` tem exatamente esse layout. Foi sorte da estrutura,
 não projeto — mas está coberto pelo teste de ponta a ponta.
 
-**`kv_append` também não precisa de shader novo:** as posições do bloco são consecutivas no
-cache, então uma única `cmd_copy_buffer` de `n_tok × kv_dim` substitui as N cópias.
+**A escrita no KV-cache** é um dispatch `KvPack` (cache em pares f16) que grava os `n_tok`
+tokens do bloco de uma vez — as posições são consecutivas no cache.
 
 **O prefill em batch está pronto** (buffers `n_batch×`, `decode_batch`, `plano_delta` com a
-recorrência em N dispatches ordenados). Sobre ele, o **verify** é um terceiro plano do
-shard, `plan_verify`, com dois tokens fixos e logits dos dois:
+recorrência do bloco inteiro num dispatch). Sobre ele, o **verify** é um terceiro plano do
+shard, `plan_verify`, com `VERIFY_TOK = 3` tokens fixos e logits de todos:
 
 | peça | onde |
 |---|---|
 | escolha do plano por `Modo` (decode / batch / verify) | `build_plan`, `record_token` |
-| `COLS = 2` nos matvec | 4 pipelines próprias, geometria do decode (`matvec_geom`) |
-| logits dos dois tokens | `b_logits` vira `vocab × 2`; **sem** requantizar |
-| recorrência com ponto de snapshot | `plano_delta_verify` (cópia deliberada de `plano_delta`) |
+| `COLS = VERIFY_TOK` nos matvec | pipelines próprias, geometria do decode (`matvec_geom`) |
+| logits dos três tokens | `b_logits` vira `vocab × 3`; **sem** requantizar |
+| recorrência com pontos de snapshot | `plano_delta_verify` (cópia deliberada de `plano_delta`) |
 | API | `ResidentForward::verify_shard`, `GpuResidentDecode::decode_verify` |
 
 O "sem requantizar" é o detalhe que barateia o verify: o `norm_p2` da norma final já escreve
-os dois tokens em `b_xq`/`b_xd` no layout `t * n_blk + b`, que é exatamente o que o matvec de
-duas colunas lê. O custo extra do segundo token é uma leitura a mais da ativação — o peso
+os três tokens em `b_xq`/`b_xd` no layout `t * n_blk + b`, que é exatamente o que o matvec de
+três colunas lê. O custo extra de cada token é uma leitura a mais da ativação — o peso
 Q6_K de 0,63 GB sai da VRAM uma vez só.
 
 ## Fase D — rollback do estado recorrente (PRONTA)
 
-48 das 65 camadas são delta-net, **com estado recorrente**. Verificar `[t+1, t+2]` avança o
-estado dois passos; rejeitar t+2 exige voltar um.
+48 das 65 camadas são delta-net, **com estado recorrente**. Verificar `[t+1, t+2, t+3]`
+avança o estado três passos; rejeitar uma proposta exige voltar um ou dois.
 
 - Estado: `n_v_heads × d_state × head_v_dim × 4 B` = 3,1 MB por camada → **151 MB**, mais
   120 KB da janela da convolução por camada.
-- O `plan_verify` copia estado e janela para buffers de snapshot **entre o token 0 e o token
-  1** de cada camada linear (`PlannedOp::Copia`). `rollback_verify()` copia de volta a partir
-  de um command buffer gravado uma única vez na construção — a rejeição custa um submit.
+- O `plan_verify` copia estado e janela para dois buffers de snapshot (`snap[i]`, depois do
+  token `i`) de cada camada linear (`PlannedOp::Copia`). `rollback_verify(manter)` copia de
+  volta `snap[manter - 1]` a partir de command buffers gravados uma única vez na construção —
+  a rejeição custa um submit.
 - Salvar + restaurar a 717 GB/s: **~0,45 ms** projetados, ~1% do passo. **Ainda não medido.**
-- O KV-cache não precisa de snapshot: as duas posições são consecutivas e o próximo passo
-  sobrescreve a segunda. Com o `rope_kv` o K já entra girado no slot, e isso não muda nada.
+- O KV-cache não precisa de snapshot: as posições são consecutivas e o próximo passo
+  sobrescreve as rejeitadas — basta recuar o comprimento.
 - Os buffers de snapshot só existem com MTP ligado (`ResidentForward::new_shard_com`).
 
-## Fase E — ligar e medir (LIGADA; falta medir)
+## Fase E — ligar e medir (LIGADA e medida)
 
 `--mtp` no `llama-cli` e no `llama-server`, **desligado por padrão**. O laço de geração do
 `llama-model` faz propor→verificar→aceitar/rollback; com sampling a proposta só é aceita se
 coincidir com o token que o sampler tira dos logits[0], então a distribuição não muda.
 
-No servidor a flag por enquanto só constrói o backend: o laço do `motor.rs` continua
-decodificando um token por passo, porque convertê-lo pede um decode de dois tokens na
-`Sessao`.
+No servidor o laço do `motor.rs` chama `Sessao::passo_mtp` e emite os aceitos por uma fila
+de pendentes.
 
 A taxa de aceitação da fase B (60,9 %) foi medida com uma proposta por token gerado. Em
 produção a cabeça propõe uma vez por **passo**, e um passo aceito emite dois tokens — o
 KV-cache da cabeça fica então uma posição atrás do do modelo a cada aceitação. É o mesmo
-desenho do llama.cpp, mas é uma diferença que a medição da fase B não exercitou: **a
-aceitação em geração real precisa ser medida de novo**, e o teste
-`greedy_com_mtp_gera_a_mesma_sequencia` já imprime esse número.
+desenho do llama.cpp. Medida em geração real greedy com as duas propostas encadeadas:
+**2,20 tokens por passo** (`greedy_com_mtp_gera_a_mesma_sequencia` imprime esse número).
 
 O `docs/mtp-e-k80.md` registra **+3,4 %** para o MTP no llama.cpp neste mesmo modelo — fator
 1,03 contra os 1,61 medidos aqui. A explicação mais provável é que a implementação dele não
 faz batch eficiente num híbrido SSM; a cabeça do modelo prevê bem. Aquele número não deve
 ser usado como estimativa do potencial.
 
-**Conta do alvo:** com a base de hoje (22,3) e aceitação de 60,9 % o MTP daria 35,9 tok/s.
-Para 50 é preciso a base em ~31,1, o que exige também o matvec Q4_K perto dos 717 GB/s e a
-fusão das dispatches pequenas. Nenhum desses números foi confirmado com o MTP ligado ainda —
-ver "O que ficou pendente de medição" em `docs/planos/2026-08-21-mtp-fases-c-e.md`.
+**Conta do alvo:** com a base de hoje (26,3 tok/s a 2k) o MTP mede 34,4 tok/s; os 50 tok/s
+pedem ainda uma base bem mais rápida — ver `docs/decode-por-configuracao.md`.

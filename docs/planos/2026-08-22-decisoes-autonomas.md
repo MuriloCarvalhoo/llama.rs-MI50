@@ -73,9 +73,10 @@ Perfis completos capturados (curto e 9,4k, `scratchpad/perfil-{curto,9k}.log`):
   (uma tentativa única):** içar as cargas das duas linhas antes do cômputo.
   Regra: se não melhorar o `TOTAL GPU`, reverter e parar — é a 5ª tentativa numa
   frente com 4 fracassos. **Resultado: 456-478 GB/s, igual ao baseline (revertido).**
-  O compilador já agrupava as cargas; os ~470 GB/s do Q4_K neste hardware são o que
-  esta estrutura de kernel entrega. Frente fechada — o caminho para a base é outra
-  quantização (plano B, Q3_K) ou nada.
+  O compilador já agrupava as cargas.
+
+  > **Atualização 2026-11-20:** os ~470 GB/s eram o DPM baixando o clock no layer-split,
+  > não o kernel: com o pstate fixo (`6a54d6e`) o mesmo shader lê 617–684 GB/s.
 - **Não ataco:** fusão das ops pequenas (~2,7 ms/GPU a 4-7 GB/s, mas são ~10 µs
   de latência de dispatch cada — ganho ~1 ms com risco alto de regressão);
   gravação de host (0,6 ms < 1 ms, regra da frente 1); GEMM para Q5_K/Q6_K no
@@ -105,4 +106,8 @@ fica pelo que entrega — metade da VRAM de contexto (32k: 4,4 → 2,2 GB) e
 paridade com o formato do llama.cpp — e o próximo ganho de atenção longa seria
 matemática f16 nativa (`V_DOT2_F32_F16`), que exige habilitar `shaderFloat16`
 no device: fica anotado como frente futura, não desta rodada.
+
+> **Atualização 2026-11-20:** no kernel atual (`attention_split16.comp`) a atenção também não
+> é limitada por conta — cortar 30% das operações deu o mesmo tempo — e o `V_DOT2` foi
+> descartado (decisão 12 de `2026-09-26-decisoes-autonomas.md`).
 

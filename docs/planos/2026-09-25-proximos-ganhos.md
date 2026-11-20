@@ -26,6 +26,8 @@ Rodada executada sem consulta; as escolhas estão em
 | 3.3 | **Feito** (`3d55d89`) |
 | 4.1–4.5 | **Feitos** (`fc432e5`, `6b6f5e1`, `5a45b8c`, `5da9f21`, `b4dd4ea`) |
 
+> **Atualização 2026-11-20:** o 3.1 deixou de ser o maior ganho: com o undervolt da card1 ela chega a 89 °C em `standard` e 96 °C em `peak`, e o `peak` dá o mesmo decode que o `standard`. A diferença de prefill para o llama.cpp HIP hoje é ~1,85× (171,9 contra 318 tok/s), não 2,8×.
+
 Surgiram no caminho:
 
 - **Travamento da GPU no prefill de contexto fundo** — corrigido (`9ff9a14`). O driver deste

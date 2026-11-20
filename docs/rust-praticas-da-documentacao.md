@@ -119,7 +119,7 @@ Defaults exatos do perfil `release` ([Cargo] profiles): `opt-level = 3`, `lto = 
 | Flag | O que a fonte afirma | Status |
 |---|---|---|
 | build de release | "speedups de 10-100x sobre dev builds são comuns" ([Perf Book] Build Configuration) | ✅ medido em §5 (`soma_matmul`) |
-| `lto = "thin"`/`"fat"` | "pode melhorar a velocidade em 10-20% ou mais" ([Perf Book]); `"thin"` roda em "substancialmente menos tempo com ganhos parecidos" ao fat ([Cargo]) | já ligado neste repo (`lto = "thin"`, com medições próprias em `rust-memoria-e-desempenho.md` §2.6) |
+| `lto = "thin"`/`"fat"` | "pode melhorar a velocidade em 10-20% ou mais" ([Perf Book]); `"thin"` roda em "substancialmente menos tempo com ganhos parecidos" ao fat ([Cargo]) | já ligado neste repo (`lto = "thin"`; números publicados em `rust-memoria-e-desempenho.md` §2.6) |
 | `codegen-units = 1` | mais unidades compilam em paralelo "mas podem produzir código mais lento" ([Cargo]); uma única unidade permite código melhor ([Perf Book]) | já ligado neste repo |
 | `-C target-cpu=native` | "pode melhorar a velocidade, especialmente se o compilador encontra oportunidades de vetorização" ([Perf Book]) | já ligado neste repo (`.cargo/config.toml`) |
 | `opt-level` | aviso da doc: nível `3` **pode ser mais lento** que `2`, e `"s"`/`"z"` não são necessariamente menores; reavaliar a cada versão do rustc ([Cargo]) | 📖 |

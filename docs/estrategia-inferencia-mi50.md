@@ -1,6 +1,6 @@
 # Estratégia de inferência nas 2× MI50 — avaliação crítica do rumo do projeto
 
-**Data:** 2026-08-13 · **Hardware:** 2× AMD MI50 / Radeon Pro VII (gfx906, 16 GB HBM2, ~1 TB/s, PCIe, sem NVLink)
+**Data:** 2026-08-13 · **Hardware:** 2× AMD MI50 / Radeon Pro VII (gfx906, 16 GB HBM2, 1 TB/s de spec e 836 GB/s medidos, PCIe, sem NVLink)
 
 Documento de pesquisa com fontes. Ele **contradiz premissas** que este projeto vinha usando —
 inclusive uma que eu afirmei nesta sessão. As correções estão marcadas.
@@ -45,7 +45,7 @@ maximum for PCIe"* e *"Stay single-GPU if model fits quantized"*.
 
 Por quê: o gargalo **não é banda**. São 96 AllReduce/token (48 camadas × 2), ~2 MB/token total —
 0.08 ms em PCIe 4.0, ~0.5% de um token. O custo é **latência × 96 sincronizações**. Isso bate com
-o que medimos no nosso próprio spike (§ `bench-results/fase8-0-baseline-14b-e-allreduce.md`).
+o que medimos no nosso próprio spike (`crates/llama-vulkan/src/spike.rs`).
 
 ---
 
@@ -70,7 +70,7 @@ Nossa baseline: **40.59 tok/s** com Qwen2.5-14B **Q8_0** (15.7 GB) em 1 MI50.
 | **Q4_K_M** | **8.9 GB** | **~71** | **−0.32 pt** |
 | Q4_0 | 8.2 GB | ~77 | −1.49 pt ← evitar |
 
-¹ **limite superior**: derivado de 1024 GB/s × 62% MBU ÷ tamanho, supondo memory-bound. Para
+¹ **limite superior**: derivado de 1024 GB/s (spec; o medido é 836) × 62% MBU ÷ tamanho, supondo memory-bound. Para
 K-quants nesta placa a realidade fica abaixo disso (ver correção no topo da seção).
 ² [arXiv 2601.14277](https://arxiv.org/html/2601.14277v1), Llama-3.1-8B, média de 5 benchmarks.
 
@@ -108,7 +108,8 @@ Duas leituras: (a) modelos maiores rendem MBU maior — já estamos no regime fa
 prático é ~80%. **Fechar 62% → 80% em 1 GPU vale 40.6 → 52 tok/s**, comparável ao ganho líquido de
 TP2, com uma fração do risco.
 
-Teto absoluto de 1 GPU: 1024/15.7 = **65.2 tok/s**. TP2 perfeito seria 130; TP2 realista, **57–69**.
+Teto absoluto de 1 GPU com a banda medida (836 GB/s, não os 1024 de spec): 836/15.7 = **53.2 tok/s**
+— os 62% de MBU acima são ~76% desse teto. TP2 perfeito seria 106; TP2 realista, **57–69**.
 
 ---
 
@@ -144,13 +145,13 @@ Investigar essa anomalia é o proxy mais barato para "quanto vai custar o TP".
   [llama.cpp docs](https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md)).
 - **Multiplica** com a quantização (§1) — são independentes.
 - **Não exige P2P nem AllReduce.** Só troca alguns tokens entre os processos.
-- É especialmente adequado aqui: prefill na MI50 é ~27× mais rápido que decode, então **verificar
-  5–8 tokens de draft custa quase o mesmo que gerar 1**.
+- Verificar não sai de graça aqui: no llama.rs o verify de 3 tokens custa 2,8× a atenção do decode,
+  e o MTP perde acima de 12k de contexto (decisões 10 e 11 de `planos/2026-09-26-decisoes-autonomas.md`).
 - Evita um bug conhecido: com os dois modelos na *mesma* GPU no Vulkan/RADV, o tempo do draft
   explode por haver uma única compute queue ([issue #23126](https://github.com/ggml-org/llama.cpp/issues/23126)).
   Duas GPUs resolvem isso naturalmente.
 
-**Alternativa igualmente barata: trocar para um MoE.** Dado medido:
+**Alternativa no llama.cpp: trocar para um MoE** (o llama.rs não suporta MoE). Dado medido:
 **Qwen3-Coder-30B-A3B Q4_K_M roda a 73.10 tok/s em 1× MI50**
 ([llama-bench](https://ahelpme.com/ai/llamacpp-ai/llama-bench-the-qwen3-coder-30b-a3b-and-amd-radeon-instinct-mi50-32gb/)).
 Em batch-1 o MoE lê só os experts ativos → modelo grande **e** decode rápido, cabendo em layer-split
@@ -231,11 +232,12 @@ o ~1.8× que a conta de banda pura sugeria.
 ### O que continua valendo
 
 - **Tensor-parallel está descartado** — e agora por três evidências independentes: sem P2P de VRAM
-  (medido aqui, §3), `-sm row` falha também no ROCm (`NO_PEER_COPY=1`), e o balanço de 96 syncs
+  (§3), `-sm row` falha também no ROCm (`NO_PEER_COPY=1`), e o balanço de 96 syncs
   × 59.3 µs come o ganho.
-- **Speculative decoding só compensa em MoE esparso.** Medido nesta máquina: +23% no 35B A3B, e
-  **net-negative no 27B denso** (23.77 → 21.95/16.57/15.67 conforme `n-max` sobe). A razão é a
-  mesma da Correção 2: se batch-1 já satura o compute, verificar N tokens custa ~N×.
+- **Speculative decoding no 27B denso:** no llama.cpp foi +23% no 35B A3B e **net-negative no 27B
+  denso** (23.77 → 21.95/16.57/15.67 conforme `n-max` sobe). O MTP do llama.rs no Qwen3.8-27B
+  (2 propostas encadeadas, só abaixo de 12k de contexto) dá 34,4 contra 26,3 tok/s com 2k (decisão
+  11 de `planos/2026-09-26-decisoes-autonomas.md`; medido em 2026-11-20).
 
 ### Ordem recomendada (revisada)
 
@@ -245,14 +247,17 @@ o ~1.8× que a conta de banda pura sugeria.
 3. Fusão de ops pequenas e redução de dispatches, que atacam o lado compute — o que de fato limita
    este hardware em K-quants.
 4. ~~Tensor-parallel~~ — descartado por medição.
-5. ~~Speculative decoding~~ — só se o alvo virar um MoE esparso.
+5. **Speculative decoding (MTP)** — feito no llama.rs: +31% com 2k de contexto, desligado acima de 12k.
+
+Os itens 1 e 2 estão feitos (layer-split e Q4_K_M); o 3 segue aberto (`planos/2026-09-25-proximos-ganhos.md`, item 2.3).
 
 ### A ressalva que continua de pé
 
 Se o objetivo é **aprender** GPU/Vulkan/inferência, construir do zero é ótima escolha e nada disso
 se aplica. O que não funciona é misturar as justificativas: o alvo honesto para "bater o llama.cpp
 no Qwen3.6-27B" é **23.8 tok/s**, não os 40.59 do Qwen2.5-14B Q8_0 que este documento usava como
-referência — são modelos, quantizações e arquiteturas diferentes.
+referência — são modelos, quantizações e arquiteturas diferentes. Hoje o modelo é o Qwen3.8-27B
+Q4_K_M, e o llama.rs faz 26,3 tok/s sem MTP com 2k de contexto (medido em 2026-11-20).
 
 ---
 
@@ -261,5 +266,3 @@ referência — são modelos, quantizações e arquiteturas diferentes.
 - Nenhuma medição pública de TP em 2× gfx906, em qualquer engine.
 - Nenhuma medição pública de MLC-LLM TP sobre Vulkan em dGPU AMD.
 - Nenhuma medição de latência de semáforo cross-device Vulkan em RADV/gfx906.
-- Nenhum benchmark de banda alcançável (BabelStream) para MI50 — os MBU acima usam os 1024 GB/s de
-  spec, logo são otimistas.

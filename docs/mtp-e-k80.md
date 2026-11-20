@@ -19,11 +19,9 @@ cabeça MTP foi treinada para prever **um** token. Pedir três obriga a rodá-la
 realimentando a própria previsão, e a qualidade da proposta desaba — cada rejeição custa
 um forward inteiro do modelo principal.
 
-Com `n-max 1` o ganho sobre não usar MTP é de **+3.4%**. É pouco perto do que
-speculative decoding costuma render porque o gargalo aqui é banda, não latência: o
-forward de verificação lê os mesmos 19.5 GB de pesos para 1 ou 2 tokens, então o teto do
-ganho é a taxa de aceitação, e o custo do draft (324 MB, ver abaixo) sai inteiro do
-orçamento.
+Com `n-max 1` o ganho sobre não usar MTP é de **+3.4%**. O limite é da implementação do
+llama.cpp, não do hardware: no mesmo modelo o MTP do llama.rs mediu fator 1,61
+([`mtp-implementacao.md`](mtp-implementacao.md)).
 
 `--spec-draft-p-min 0.6` colapsa para 1.8 tok/s — um caminho degenerado, não uma
 degradação suave. Ficar no default (0.0).
@@ -57,6 +55,9 @@ parede; só muda onde os 324 MB são lidos.
 | MI50 (medido) | 717 GB/s | **0.45 ms** |
 | K80 (GDDR5, ~180 GB/s efetivos) | 240 GB/s de pico | **1.8 ms** |
 
+> **Atualização 2026-11-20:** o teto medido da MI50 é 836 GB/s; o draft cairia para ~0.39 ms
+> e a conclusão não muda.
+
 Some a transferência do hidden state (`n_embd` = 5120 floats = 20 KB) entre vendors
 diferentes: sem P2P, o caminho é MI50 → host → K80 → host → MI50, e medimos 59 µs por
 sincronização host-mediada neste hardware (`crates/llama-vulkan/src/spike.rs`) — mais
@@ -74,7 +75,7 @@ contra os 0.45 ms que se economiza nas MI50. Perda líquida de ~4%.
 Ou seja, seria preciso portar kernels para uma arquitetura de 2014 para ganhar acesso a
 uma GPU 4× mais lenta, num trecho que representa 1.66% do trabalho e não pode ser
 sobreposto. É a mesma conclusão a que o projeto já tinha chegado por outro caminho
-(`README.md`, seção "Hardware alvo"): a K80 só faria sentido como worker isolado de
+([`hardware.md`](hardware.md), seção "Por que só AMD"): a K80 só faria sentido como worker isolado de
 layer-split, e nem isso paga o custo de uma segunda família de kernels.
 
 **Onde a K80 poderia ajudar, em tese:** servindo requisições independentes em paralelo
@@ -82,7 +83,7 @@ layer-split, e nem isso paga o custo de uma segunda família de kernels.
 
 ## O que isso significa para o llama-rs
 
-O alvo do Qwen3.8-27B em 2× MI50 passa a ser **21.5 tok/s** (llama.cpp com MTP bem
-configurado). Sem MTP, 20.8. Como o llama-rs ainda não implementa speculative decoding, a
-comparação justa no primeiro momento é contra os 20.8 — e o MTP fica como trabalho
-posterior, com a lição já registrada: propor **um** token, não três.
+O llama.cpp com MTP bem configurado faz **21.5 tok/s** no Qwen3.8-27B Q5_K_M; sem MTP, 20.8.
+O llama-rs já implementa o MTP: 2 propostas encadeadas por passo (verify de 3 tokens),
+ligado só abaixo de 12k de contexto (`LLAMA_RS_MTP_ATE`). Medido em 2026-11-20 com o
+Q4_K_M: 26.3 tok/s sem MTP e 34.4 com MTP a 2k de contexto.

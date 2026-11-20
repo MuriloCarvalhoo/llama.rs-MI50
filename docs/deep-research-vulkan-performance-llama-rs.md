@@ -8,12 +8,14 @@
 
 O llama.cpp apresenta **quatro limitações arquiteturais críticas** que uma reescrita em Rust (llama.rs) pode resolver:
 
-1. **Vulkan: Sub-alocação de memória fragmentada** — falhas de alocação em drivers conservadores (AMDVLK 2GB) apesar de VRAM abundante; defasagem de 2.6x vs ROCm em multi-GPU
+1. **Vulkan: Sub-alocação de memória fragmentada** — falhas de alocação em drivers conservadores (AMDVLK 2GB) apesar de VRAM abundante
 2. **Vulkan: Dequantização ineficiente + wave64 incompatível** — Flash Attention degrada 2x em RDNA1, falha em gfx906 para MoE; overhead de dequantização por-elemento
 3. **Runtime ggml: Overhead CPU redundante** — grafo estático recomputado, threads recriadas por iteração, 256µs overhead medido; 10-15% de CPU por token
 4. **Quantização: Formatos hostis a GPU** — dequantização elemento-a-elemento vs. packed-int SIMD (CUDA), no algorithmic graph scheduling
 
-**Para MI50 especificamente:** Ceiling de speedup ~1.3x com tensor cores (inútil em memoria-bound). Uma reescrita em Rust com sub-alocador (VMA), geração de SPIR-V architecture-aware (DPP wave64), contextos de grafo persistentes, e async compute queues poderia recuperar **4-7x em overhead CPU** e **2-3x em multi-GPU**, com payoff imediato via wave64-DPP e packed-int dequant.
+**Para MI50 especificamente:** Uma reescrita em Rust com sub-alocador (VMA), geração de SPIR-V architecture-aware (DPP wave64), contextos de grafo persistentes, e async compute queues poderia recuperar **4-7x em overhead CPU**, com payoff imediato via wave64-DPP e packed-int dequant.
+
+> **Atualização 2026-11-20:** a MI50 não tem tensor cores; o tensor-split foi descartado neste hardware (sem P2P, ver [`estrategia-inferencia-mi50.md`](estrategia-inferencia-mi50.md)); e o dot int8 empacotado rendeu ~0% no matvec do llama.rs ([`performance-tuning.md`](performance-tuning.md)).
 
 ---
 
@@ -86,6 +88,8 @@ Batch-1 matmul = ~1 FLOP/byte (FP16). GPUs modernas expõem 100-400 FLOPs/byte.
 
 **MI50 roofline:** 1 TB/s bandwidth ÷ 27 FP16 TFLOPS = 37 MB/TFLOP **→ memory-bandwidth ceiling**
 
+> **Atualização 2026-11-20:** a banda medida da MI50 é 836 GB/s, não 1 TB/s.
+
 **Implicação:** Tensor cores produzem ganho mínimo em token generation:
 - Prompt processing (batch-N, compute-bound): **2.5-3x com cooperative matrices**
 - Token generation (batch-1, memory-bound): **poucos % ou nenhum ganho**
@@ -98,7 +102,7 @@ Batch-1 matmul = ~1 FLOP/byte (FP16). GPUs modernas expõem 100-400 FLOPs/byte.
 
 **Confiança:** High (2-1)
 
-Multi-GPU Vulkan (layer-split apenas): **3x mais lento** vs. ROCm com row-split  
+Multi-GPU Vulkan (layer-split apenas) vs. ROCm com row-split  
 - Vulkan: pp512=324.55 t/s, tg128=38.39 t/s (5× Radeon Pro VII + MI25)
 - ROCm row-split: pp512=30.86 t/s, tg128=12.52 t/s (mesmo hardware)
 
@@ -224,12 +228,12 @@ Afirmações que falharam em verificação adversarial:
 1. **Buffer management sub-allocator (VMA-style)**
    - Aloca pequenos sub-blocks vs. monolithic
    - Evita maxMemoryAllocationSize driver limits
-   - **Payoff:** Libertar 85GB+ VRAM preso
+   - **Payoff:** contornar o limite de `maxMemoryAllocationSize` (os 85 GB eram de outra máquina; a MI50 tem 16 GB)
 
 2. **Architecture-aware SPIR-V generation (wave64)**
    - Dequantização packed-integer (como CUDA)
    - DPP shuffle/reduction macros para wave64 (implementação do fork existe)
-   - **Payoff:** 2x Flash Attention degradation desaparece
+   - **Payoff:** não medido em gfx906 (a degradação 2x do Flash Attention foi medida na RDNA1)
 
 3. **Persistent graph contexts + async compute**
    - Reuse threads, evita 256µs overhead per-token
@@ -239,7 +243,8 @@ Afirmações que falharam em verificação adversarial:
 4. **Global scheduler optimization (dynamic programming)**
    - Decisão deliberada se custo vale a pena
    - Potencial 10-15% melhoria em multi-GPU/multi-backend
-   - **Payoff:** 2-3x em tensor-split (vs. layer-split apenas)
+
+> **Atualização 2026-11-20:** o tensor-split foi descartado neste hardware (sem P2P; ver [`estrategia-inferencia-mi50.md`](estrategia-inferencia-mi50.md)).
 
 ### Trade-offs a Considerar
 

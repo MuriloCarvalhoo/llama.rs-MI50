@@ -81,6 +81,9 @@ por camada **por token** do bloco.
       pressão de registrador dos acumuladores `COLS` reverter a curva — o ponto ótimo é
       empírico e provavelmente ≤32 sem GEMM. **Pendente de medição.**
 
+> **Atualização 2026-11-20:** `batch_size()` vai até 256 (padrão 32), e o bloco padrão é
+> escolhido pelo modelo em `batch_do_modelo`: 256 quando todas as matrizes vão pelo GEMM.
+
 ## Tarefa 3 — GEMM com tiling em LDS (etapa 2 do desenho antigo)
 
 **Arquivos:** novo `crates/llama-vulkan/shaders/mul_mm.comp`, `resident_forward.rs`
@@ -109,6 +112,9 @@ matvec-COLS. O Q5_K é estruturalmente igual ao Q4_K (mesma escala/mínimo de 6 
 (sub-blocos de 16, não de 32), o que muda o formato do tile. Só faz sentido pagar isso
 depois de o A/B do Q4_K justificar o caminho.
 
+> **Atualização 2026-11-20:** o GEMM é o padrão (`LLAMA_RS_PREFILL_GEMM=0` desliga), o Q5_K
+> vai pelo GEMM por padrão e o Q6_K só com `LLAMA_RS_GEMM_Q6K=1`.
+
 ## Tarefa 4 — Servidor: reuso tolerante e TTFT medido
 
 **Arquivos:** `crates/llama-model/src/sessao.rs`, `crates/llama-server/src/motor.rs`,
@@ -119,10 +125,11 @@ recorrente não volta atrás. Um snapshot por fronteira de turno torna a diverg�
 barata sem tocar em shader:
 
 - [x] Copiar `estado` + `janela` + comprimento do KV para um snapshot (~155 MB de VRAM, 1
-      só). **A fronteira é o fim do prefill, não o fim da resposta**: o que diverge no
-      turno seguinte é o re-render da resposta que o modelo acabou de gerar, e ela vem
-      toda depois do fim do prompt — guardar o fim da resposta deixaria a divergência
-      antes do snapshot, ou seja, sem cobertura.
+      só), no fim do prefill.
+
+      > **Atualização 2026-11-20:** o fim do prefill também é re-renderizado no turno
+      > seguinte (o BPE funde o `\n` final), e o cache dava `0` em todo turno. O snapshot
+      > passou para depois do último token especial em `1769c35` (TTFT a 30k: 387 → 31,5 s).
 - [x] `planejar_reuso` ganha o caso `RecuarPara{pos}`: se o prefixo diverge **depois**
       da posição do snapshot, restaurar e reprocessar só dali; se diverge antes, cai no
       `Reiniciar` de hoje. `prefixo_comum` do servidor espelha a mesma decisão, senão o

@@ -34,6 +34,9 @@ de 60,9%**. O que falta está mapeado, não é pesquisa.
 medido) custam 22,85 ms sozinhos. **Não existe 50 tok/s token-a-token neste modelo e
 quantização** — o caminho é multiplicar tokens por passo com o MTP do próprio modelo:
 
+> **Atualização 2026-11-20:** o teto de HBM medido é 836 GB/s (`scripts/teto-mi50.hip`): os
+> matvec custam 19,6 ms, e o alvo segue sem caber com as outras ops.
+
 ```
 tok/s = (1 + aceitação) / t_passo        aceitação medida (greedy, n=1): 60,9%
 ```

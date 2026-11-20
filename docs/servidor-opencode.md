@@ -28,8 +28,8 @@ As gerações são atendidas uma por vez; até 4 esperam na fila, e além disso 
 com `Retry-After`. `/health` e `/v1/models` respondem mesmo durante uma geração. Prazos do
 socket: `--timeout-leitura` (30 s sem receber nada → 408) e `--timeout-escrita` (60 s com a
 escrita bloqueada → a geração é cancelada). Parâmetro inválido (`temperature` fora de
-[0, 2], `n > 1`, `response_format` que não seja `text`...) é 400, e `model` diferente do
-`--nome` é 404 `model_not_found`.
+[0, 2], `n > 1`, `response_format` que não seja `text`...) é 400; `model` diferente do
+`--nome` é atendido com o modelo servido e deixa uma linha `[api]` no log.
 
 ## Config do opencode
 
@@ -94,19 +94,20 @@ recuar o comprimento e deixar os tokens novos reescreverem os slots), mas o esta
 recorrente é o produto de todos os tokens processados, em ordem. Pelo mesmo motivo não dá
 para reprocessar um token que já entrou.
 
-**Snapshot de fronteira de turno.** No fim do prefill de cada requisição a sessão manda o
-backend copiar o estado recorrente, a janela da convolução e o comprimento do KV — ~155 MB
+**Snapshot de fronteira de turno.** No prefill de cada requisição, logo depois do último token
+especial do prompt, a sessão manda o backend copiar o estado recorrente, a janela da convolução e o comprimento do KV — ~155 MB
 de VRAM, um snapshot só. Divergência **depois** dessa posição recua até ela
 (`Reuso::RecuarPara`) em vez de reiniciar; divergência antes ainda custa tudo.
 
-A fronteira é o fim do prompt, não o fim da resposta, porque é a **resposta** que o turno
+A fronteira fica no prompt (depois do último token especial, que o BPE nunca funde com o
+texto seguinte), não no fim da resposta, porque é a **resposta** que o turno
 seguinte re-renderiza: o cliente que não devolve o `reasoning_content` no histórico faz o
 template reconstruir o turno do assistant diferente do que foi gerado, e essa divergência
 começa depois da fronteira. Antes do snapshot isso reprocessava o prompt inteiro; agora
 reprocessa só a resposta e o turno novo. Com o raciocínio de volta o texto re-renderizado
 bate byte a byte e nem isso é preciso.
 
-*Pendente de medição no modelo real.*
+Medido no modelo real (`1769c35`): TTFT com 30k de contexto de 387 s para 31,5 s.
 
 ## Custo de contexto em VRAM
 
@@ -153,19 +154,16 @@ do pedido (render do template e tokenização incluídos, porque o cliente esper
 É o número que decide a experiência com prompt grande: a taxa de decode não compensa
 minutos de espera antes de a resposta começar. *Medido via CLI em 2026-08-21 (prompt de
 9 312 tokens, batch 24 + GEMM, greedy): prefill a 12,75 ms/token → **TTFT ≈ 2 min** do
-zero (sem cache de prefixo). O batch de 24 é pequeno demais para amortizar o peso como o
-llama.cpp faz com blocos de 512; subir o teto do bloco é a próxima fronteira do prefill.*
+zero (sem cache de prefixo).* Hoje o bloco é de 256 tokens: prefill frio a 170/153/126/93
+tok/s com 2k/8k/16k/30k (2026-11-20), ~1,85× abaixo do llama.cpp HIP (318 contra 171,9 com
+7,5k).
 
 ## Uma requisição por vez
 
-O laço de conexões é sequencial. Os pesos são residentes e um único decode já satura a
-banda das duas placas; atender duas requisições em paralelo dividiria a mesma banda e
-ainda embaralharia a sessão do KV-cache.
+Uma thread de HTTP lê as requisições e um worker gera, uma por vez, com até 4 na fila. Os
+pesos são residentes e um único decode já satura a banda das duas placas; atender duas
+requisições em paralelo dividiria a mesma banda e ainda embaralharia a sessão do KV-cache.
 
 ## O que não está implementado
 
-- **A largura de bloco ótima do prefill.** O teto subiu de 8 para 32 (`LLAMA_RS_BATCH`) e o
-  GEMM com tiling em LDS existe atrás de `LLAMA_RS_PREFILL_GEMM=1`, mas **qual das duas
-  ganha, e em que largura, é medição que ainda não foi feita** — ver
-  `docs/prefill-em-batch.md`.
 - Imagens (o runtime não tem visão), `logprobs`, `n > 1`, penalidades de repetição.

@@ -37,16 +37,18 @@ LLAMA_RS_SPLIT=31 numactl --interleave=all target/release/llama-cli \
 | MTP ligado, contexto 9,3k | 22,1 | 59,5 (passo de 2 tok) | 1 execução; a atenção de contexto longo domina |
 | **MTP n=2 encadeado (2026-08-22)** | **34,5** | 56,2 (passo de 3 tok) | 3 execuções: 31,4 36,2 36,0; greedy; verify = 27,5 + 28,5 ms |
 | MTP n=2 pelo servidor (motor propor→verificar) | 36,2 | — | `[gen] decode 80 tok (36.2 tok/s)`, greedy; temp 0,8 dá 32,6 |
-| KV-cache f16 empacotado (`kv_pack.comp`) | 33,7 | 55,8 (passo de 3 tok) | 2 execuções: 35,8 31,6; **a atenção a 9,4k não mudou** (11,5 ms/token) — ela é limitada por VALU, não por banda. O que o f16 entrega: metade da VRAM de contexto e paridade de formato com o llama.cpp |
+| hoje (2026-11-20): pstate fixo (`6a54d6e`), MTP só abaixo de 12k (`MTP_ATE`) | 26,3 / 24,4 / 22,5 | — | sem MTP a 2k / 8k / 16k de contexto; com MTP, 34,4 / 29,3 a 2k / 8k |
+| KV-cache f16 empacotado (`kv_pack.comp`) | 33,7 | 55,8 (passo de 3 tok) | 2 execuções: 35,8 31,6; **a atenção a 9,4k não mudou** (11,5 ms/token) — ela não é limitada por banda de HBM. O que o f16 entrega: metade da VRAM de contexto e paridade de formato com o llama.cpp |
 
 ### Atenção longa: fatias × tempo (9,4k, decode, soma das 2 GPUs)
 
 `LLAMA_RS_ATTN_SPLIT` ∈ {4, 8, 16}: 20,1 → 12,6 → **11,6 ms/token**. A curva achata em
-16 (o default de `splits_do_kv` já satura o paralelismo); o resto é teto de VALU do
-kernel — wave64 gasta 4 ciclos por instrução e o laço faz ~100 instruções por posição.
-O próximo ganho seria `V_DOT2_F32_F16` (matemática f16 nativa), que exige
-`shaderFloat16` no device — frente futura.
-| `LLAMA_RS_ROPE_KV=0` (agora padrão) | — | 40,2 | 3 execuções; a fusão rope→KV custava ~0,4 ms/token |
+16 (o default de `splits_do_kv` já satura o paralelismo). O kernel atual é o
+`attention_split16.comp` (`684b0da`), e ele não é limitado por conta: cortar 30% das
+operações do laço deu o mesmo tempo, que acompanha o clock do núcleo — a suspeita é a L2.
+Por isso o `V_DOT2_F32_F16` foi descartado (decisão 12 de
+`planos/2026-09-26-decisoes-autonomas.md`).
+| sem a fusão rope→KV (`rope_kv`, removida em 2026-08-22) | — | 40,2 | 3 execuções; a fusão rope→KV custava ~0,4 ms/token |
 | `LLAMA_RS_MATVEC_LDS_PAD=13` | — | 41,6 | 1 execução; pior, knob fica 0 |
 | `LLAMA_RS_MATVEC_LDS_PAD=22` | — | 51,2 | 1 execução; muito pior (−26 % de ocupância útil) |
 
@@ -55,11 +57,12 @@ O próximo ganho seria `V_DOT2_F32_F16` (matemática f16 nativa), que exige
 `cargo test -p llama-vulkan --test mtp_aceitacao -- --nocapture`, greedy, 23 propostas
 verificadas contra o token que o modelo de fato produziu: **14 acertos, 60,9 %**.
 
-Isso é o teto do ganho: `tok/s = base × (1 + aceitação) = base × 1,61`.
+Com uma proposta por passo, `tok/s = base × (1 + aceitação) = base × 1,61`; com as duas
+propostas encadeadas de hoje o passo rende 2,20 tokens em geração real.
 
 | base | com MTP a 60,9 % |
 |---:|---:|
-| 22,3 (hoje) | 35,9 |
+| 22,3 (2026-08-21) | 35,9 |
 | 28 (banda parcial) | 45,1 |
 | **31,1 (banda + fusão de ops)** | **50,1** |
 
@@ -72,8 +75,8 @@ verify de 2 tokens custa 47,8 ms de GPU contra 40,7 do decode de 1 (+17 %): veri
 segundo token quase de graça é o que paga o MTP.
 
 **Aceitação encadeada (n=2)**: 1º token 56,5 % (13/23), 2º condicionado ao 1º **41,7 %**
-(5/12) → 1,80 tokens/passo contra 1,57 do n=1. Acima do limiar de 40 % do plano: propor
-2 tokens é a próxima frente (amostra pequena — revalidar com mais tokens).
+(5/12) → 1,80 tokens/passo contra 1,57 do n=1. Acima do limiar de 40 % do plano: o n=2
+foi implementado em 2026-08-22 (verify de 3 tokens) e dá 2,20 tokens/passo em geração real.
 
 ### Requests por superbloco do Q4_K — a conta não explica os 13%
 
@@ -88,8 +91,9 @@ Não é medição, é a conta de papel e lápis que fechou o Q5_K, refeita para 
 As escalas do Q4_K não custam request: moram nos bytes 4..15 do mesmo `uvec4` do par
 `d|dmin`, que já é lido. As 8 lanes de um superbloco cobrem os 9 `uvec4` sem reler byte
 nenhum — **não há folga para empacotar**. E o kernel que faz *mais* requests é o mais
-rápido, o que descarta a taxa de requests como causa da diferença. Sobra ocupância:
-o Q4_K, sem os registradores de `qh`, cabe com mais waves por SIMD.
+rápido, o que descarta a taxa de requests como causa da diferença. A hipótese seguinte foi
+ocupância (o knob abaixo, que piorou); a causa era o clock: com o pstate fixo (`6a54d6e`) o
+mesmo shader lê 617–684 GB/s.
 
 Daí o knob `LLAMA_RS_MATVEC_LDS_PAD=K` (LDS morta por workgroup, `LDS_PAD_KIB` no shader,
 default 0 = kernel inalterado). Com a geometria padrão (WG=256), K KiB limitam os
@@ -99,25 +103,26 @@ workgroups por CU — e portanto as waves por SIMD — a `floor(64/K)`:
 |---|--:|---:|---:|---:|---:|---:|
 | waves/SIMD | 7 | 5 | 4 | 4 | 2 | 1 |
 
-**Nada medido ainda.** O teste de shader confirma só que o resultado não muda com o pad
-ligado (erro relativo idêntico em K = 0, 13 e 33).
+Medido: K = 13 e 22 pioram (41,6 e 51,2 ms, tabela acima); o knob fica 0. O teste de
+shader confirma que o resultado não muda com o pad ligado (erro relativo idêntico em K = 0,
+13 e 33).
 
-### Fusão das ops pequenas — implementada, **não medida**
+### Fusão das ops pequenas
 
-Quatro fusões da frente 1 (`docs/planos/2026-08-21-decode-base.md`). Todas validadas
-contra referência de CPU ou contra o shader que substituem, nenhuma medida ainda —
-a linha de tok/s e `TOTAL GPU` fica em aberto.
+Quatro fusões da frente 1 (`docs/planos/2026-08-21-decode-base.md`), todas validadas
+contra referência de CPU ou contra o shader que substituem. As três primeiras ficaram; a
+quarta mediu ~0,4 ms/token pior e foi removida em 2026-08-22.
 
 | fusão | shader | efeito no plano | knob |
 |---|---|---|---|
 | L2 de q e k | `dn_l2_qk.comp` | 96 → 48 dispatches/token | — (padrão) |
 | portão + quantize | `gate_quant.comp` | −1 dispatch por camada de atenção | — (padrão) |
 | SwiGLU + quantize | `swiglu_quant.comp` | −1 dispatch por camada (são 65) | — (padrão) |
-| RoPE de K no cache | `rope_kv.comp` | −1 cópia e −1 barreira por camada de atenção | `LLAMA_RS_ROPE_KV=0` volta |
+| RoPE de K no cache | `rope_kv.comp` (removido) | −1 cópia e −1 barreira por camada de atenção | — |
 
 As três primeiras são fusão pura (mesma matemática, menos dispatches) e entraram como
-padrão sem knob. A quarta não reduz dispatches — troca uma cópia por uma escrita direta —
-então tem saída de emergência para o A/B, como o `LLAMA_RS_NO_GROUP` das barreiras.
+padrão sem knob. A quarta não reduzia dispatches — trocava uma cópia por uma escrita
+direta — e o cache em f16 empacotado a invalidou de vez.
 
 ### Varredura de geometria do matvec — sem efeito
 
@@ -198,9 +203,9 @@ manda no primeiro turno).
 
 A amostragem, suspeita óbvia, **não** é o problema: 0,4–1,4 ms/token medidos.
 
-O prefill em batch de 8 rende ~3× sobre o decode (73 contra 22 tok/s), não 8×: as 48
-camadas delta-net são recorrentes e rodam um dispatch por token, e a atenção em batch tem
-o mesmo problema de banda acima.
+O prefill em batch de 8 rendia ~3× sobre o decode (73 contra 22 tok/s). Hoje o delta-net
+roda o bloco inteiro num dispatch e o bloco é de 256 tokens: 170 / 153 / 126 tok/s de
+prefill em 2026-11-20, com 2k, 8k e 16k tokens de prompt de código.
 
 ## llama.cpp no mesmo hardware — referência
 
@@ -221,26 +226,27 @@ pôde ser reconfirmado.
 
 ## Tetos por banda — o que é fisicamente possível
 
-Bytes lidos por token × 717 GB/s (banda de matvec medida neste projeto). O teto considera
-**só** os matvec; some ~7 ms para as demais ops e o host.
+Bytes lidos por token × 836 GB/s (teto de HBM medido por `scripts/teto-mi50.hip`). O teto
+considera **só** os matvec; some ~7 ms para as demais ops e o host.
 
 | modelo | GB/token | teto matvec | com +7 ms |
 |---|---:|---:|---:|
-| Qwen3.8-27B Q4_K_M | 16,38 | 43,8 tok/s | 33,5 |
-| Qwen3.8-27B Q3_K_M (estimado) | ~13,0 | 55 | 39,8 |
-| Qwen3.8-27B Q2_K (estimado) | ~10,2 | 70 | 47 |
-| Qwen3-14B Q3_K_M | ~7,0 | 102 | 52 |
-| **Qwen3.6-35B-A3B MoE** | **1,98** | **363** | **103** |
+| Qwen3.8-27B Q4_K_M | 16,38 | 51,0 tok/s | 37,6 |
+| Qwen3.8-27B Q3_K_M (estimado) | ~13,0 | 64 | 44,3 |
+| Qwen3.8-27B Q2_K (estimado) | ~10,2 | 82 | 52 |
+| Qwen3-14B Q3_K_M | ~7,0 | 119 | 65 |
+| **Qwen3.6-35B-A3B MoE** | **1,98** | **422** | **107** |
 
 **50 tok/s = 20,00 ms/token.** No 27B Q4_K_M os matvec sozinhos, com 100% de eficiência,
-já custam 22,85 ms — o alvo não cabe sem reduzir bytes ou multiplicar tokens por passo.
+já custam 19,6 ms — sobram 0,4 ms para o resto, então o alvo não cabe sem reduzir bytes ou
+multiplicar tokens por passo.
 Daí o MTP: `tok/s = base × (1 + taxa de aceitação)`.
 
 ## Modelos disponíveis e seus aceleradores
 
 | arquivo | arch | acelerador | suportado pelo llama-rs |
 |---|---|---|---|
-| Qwen3.8-27B-Q4_K_M | `qwen35` | MTP (`nextn_predict_layers=1`) | sim (MTP a implementar) |
+| Qwen3.8-27B-Q4_K_M | `qwen35` | MTP (`nextn_predict_layers=1`) | sim (MTP com `--mtp`) |
 | Qwen3.8-27B-Cold-Fusion-…-MTP | `qwen35` | **idêntico ao acima** — "MTP" no nome é rótulo | sim |
 | Qwen3.6-27B-Fable-…-MTP | `qwen35` | **idêntico** | sim |
 | Qwen3.6-35B-A3B | `qwen35moe` | MoE 8/256 experts | **não** |

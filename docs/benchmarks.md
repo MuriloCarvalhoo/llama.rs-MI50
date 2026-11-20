@@ -15,8 +15,11 @@ método em [`benchmark-conversa-longa-2026-09-25.md`](benchmark-conversa-longa-2
 | 15.745 | **24,0** | **25,2** | 21,9 | 19,7 |
 | 30.644 | **22,2** | 20,3 | 20,4 | 19,5 |
 
-Prefill: o llama.cpp é ~2,8× mais rápido (318 contra 115 tok/s com 7,6k), e o llama.rs ainda
-refaz o prefill inteiro a cada turno de uma conversa (387 s de TTFT com 30k).
+Desde `35ceb64` o `--mtp` só especula abaixo de 12k tokens; acima disso o decode é o da coluna
+sem MTP.
+
+Prefill: o llama.cpp é ~1,85× mais rápido (318 contra 171,9 tok/s com 7,5k, desde o bloco de
+256). O snapshot na fronteira do turno (`1769c35`) levou o TTFT com 30k de 387 s para 31,5 s.
 
 ## Qwen3.8-27B (híbrido atenção + gated delta-net), 2× MI50 layer-split
 
@@ -25,8 +28,8 @@ refaz o prefill inteiro a cada turno de uma conversa (387 s de TTFT com 30k).
 | llama-rs, Q5_K_M | 25.5 |
 | llama-rs, Q4_K_M | **26.9** |
 | llama.cpp, Vulkan, baseline (sem MTP) | 17.0 – 20.6 |
-| llama.cpp, ROCm/HIP, baseline (sem MTP) | 19.5 |
-| llama.cpp, ROCm/HIP, com MTP bem configurado | até 23.1 |
+| llama.cpp, ROCm/HIP, baseline (sem MTP) | 20.4 – 23.4 |
+| llama.cpp, ROCm/HIP, com MTP | 19.4 – 21.5 (abaixo do sem MTP) |
 
 O intervalo do llama.cpp reflete profundidade de contexto — os dois extremos (prompt curto vs
 ~8K tokens de contexto acumulado) foram medidos separadamente. Os números do llama-rs foram
@@ -53,9 +56,7 @@ O caso que justifica dividir entre as duas GPUs: 22.2 GB não cabem numa placa s
 | llama-rs | 28.0 | 0.69× |
 | llama.cpp (Vulkan) | 40.59 | — |
 
-Modelo que cabe inteiro numa GPU — aqui o llama.cpp ainda ganha. 40.59 tok/s corresponde a ~62%
-de utilização de banda de memória (MBU); o teto físico de uma MI50 fica perto de 65 tok/s para
-este tamanho de modelo, então não há uma vitória fácil escondida aqui.
+Modelo que cabe inteiro numa GPU — aqui o llama.cpp ainda ganha.
 
 ## Qwen2.5-0.5B Q8_0, 1× MI50
 
@@ -82,7 +83,7 @@ pequenos, não é otimizado com os mesmos kernels vetorizados que o llama.cpp us
 - **Tensor-parallel / row-split entre as 2 GPUs** — sem P2P de VRAM neste hardware, o custo de
   sincronização por camada (96 all-reduces/token num modelo de 14B) supera a banda que
   economizaria. Ver [`estrategia-inferencia-mi50.md`](estrategia-inferencia-mi50.md).
-- **MTP / speculative decoding "ingênuo"** — o gargalo do decode aqui é banda de memória, não
-  latência: verificar 2 tokens ainda lê quase os mesmos bytes de pesos que verificar 1. Medido no
-  llama.cpp de referência neste mesmo hardware/modelo: só **+3–5%**, não uma multiplicação. Ver
+- **MTP no llama.cpp** — neste hardware/modelo o MTP do llama.cpp perde em todas as
+  profundidades. O do llama.rs (`--mtp`) rende +31% com 2k e +20% com 8k (Qwen3.8-27B Q4_K_M,
+  2026-11-20: 34,4/29,3 contra 26,3/24,4 tok/s) e desliga acima de 12k. Ver
   [`mtp-e-k80.md`](mtp-e-k80.md).

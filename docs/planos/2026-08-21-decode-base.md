@@ -16,6 +16,9 @@ pré-requisito aritmético do "com MTP ≥50".
 > comportamento antigo (`LLAMA_RS_MATVEC_LDS_PAD`, `LLAMA_RS_ROPE_KV`); as fusões puras
 > — mesma matemática, menos dispatches — entraram como padrão.
 
+> **Atualização 2026-11-20:** o `LLAMA_RS_ROPE_KV` não existe mais (o `rope_kv` foi removido
+> em 2026-08-22), e o Q4_K chegou a 617–684 GB/s pelo pstate fixo (`6a54d6e`), não por shader.
+
 **Onde está o tempo hoje** (`LLAMA_RS_PROFILE=1`, soma das 2 GPUs, pós-`dn_gates`):
 
 | op | ms/token | banda | teto realista |
@@ -76,6 +79,8 @@ cada um A/B pelo `TOTAL GPU` e revertido se não pagar:
       por `LLAMA_RS_MATVEC_LDS_PAD=K`, **default 0 = comportamento atual**. K=22 dá 2
       waves/SIMD e K=13 dá 4 (tabela no shader). Só a pipeline do decode; a do bloco tem
       outra geometria. **Pendente de medição** — nenhum K foi comparado ainda.
+
+      > **Atualização 2026-11-20:** medido depois — K = 13 e 22 pioram (41,6 e 51,2 ms); fica 0.
 - [ ] **Distribuir a cauda**: com `(256,2)` cada dispatch cobre n_linhas/8 workgroups;
       medir se o último rank de workgroups deixa SIMDs ociosos (visível no trace
       Perfetto, `docs/debugging.md`). Se sim, testar grid 2D com menos linhas por
@@ -132,6 +137,8 @@ integração) — o risco conhecido é binding silencioso errado
       Teste `rope_kv_escreve_no_slot_o_mesmo_que_o_rope_mais_a_copia`: saída **bit a bit**
       igual à do `rope.comp` em rotary completa e parcial, com 1 e 2 tokens.
       **Pendente de medição.**
+
+      > **Atualização 2026-11-20:** medido ~0,4 ms/token pior; shader, knob e teste removidos em 2026-08-22.
 - [ ] Medir o conjunto; alvo ≤4,5 ms para "outras ops". **Pendente de medição.**
 
 ## Tarefa 4 — Host: só se a medição mandar

@@ -6,6 +6,9 @@
 > **Estado:** as quatro tarefas estão implementadas; o que falta é **medir**. Nenhum
 > número foi escrito aqui sem medição — a tabela de tempos continua vazia de propósito.
 
+> **Atualização 2026-11-20:** medido depois — carga quente em 4,5–5,0 s (resultado em
+> `2026-08-21-visao-geral-50-toks.md`).
+
 **Meta:** subir os 16,3 GB do Qwen3.8-27B para as duas MI50 em ≤6 s com page cache
 quente; com cache frio, ficar limitado pela leitura do disco (+20% no máximo). Além do
 tempo, devolver ~5 GB de RAM que a carga desperdiça hoje.

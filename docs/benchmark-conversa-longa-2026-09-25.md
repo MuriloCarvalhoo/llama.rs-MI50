@@ -6,6 +6,8 @@ profundidades (22,2 contra 20,4 tok/s com 30,6k tokens no contexto). No **prefil
 com 30k tokens, a primeira palavra da resposta sai em 387 s, contra ~11 s do llama.cpp. Isso é o
 que mais pesa no uso com agentes, e é o item 1 de [`planos/2026-09-25-proximos-ganhos.md`](planos/2026-09-25-proximos-ganhos.md).
 
+> **Atualização 2026-11-20:** o prefill não é mais refeito a cada turno (`1769c35`: TTFT com 30k de 387 s para 31,5 s), a diferença no prefill frio caiu para ~1,85× (171,9 contra 318 tok/s com 7,5k) e o `--mtp` só especula abaixo de 12k.
+
 Medido em 2026-09-25, llama.rs `8edf6da`, llama.cpp `cd83f27ef` (build HIP/ROCm para gfx906).
 
 ## Condições

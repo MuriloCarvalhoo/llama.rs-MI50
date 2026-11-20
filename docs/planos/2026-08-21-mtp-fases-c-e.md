@@ -4,6 +4,10 @@
 > é **medir**: nenhum número desta frente foi levantado no modelo real ainda, e os testes que
 > o exigem dão skip limpo sem o GGUF. Ver "O que ficou pendente de medição" no fim.
 
+> **Atualização 2026-11-20:** medido depois — n=2 encadeado (verify de 3 tokens) lossless em
+> 256 tokens, 34,5 tok/s contra 21,8 sem MTP (1,58×). Hoje o MTP só roda abaixo de 12k de
+> contexto (`LLAMA_RS_MTP_ATE`); ver `docs/mtp-implementacao.md`.
+
 > **Para execução:** depende só da frente 0 (diff pendente commitado). Fases A e B já
 > estão prontas (`docs/mtp-implementacao.md`): bloco carregado (`MtpRaw`/`MtpAux`),
 > cabeça rodando na CPU, **aceitação 60,9% medida** em greedy com propostas de 1 token.
@@ -197,6 +201,9 @@ token condicionados ao 1º ter acertado.
 
 Nada desta frente foi medido: a worktree não tem o `models/`. Todos os números abaixo são
 projeções herdadas do plano, não observações.
+
+> **Atualização 2026-11-20:** aceitação real, `a₂` e tok/s com/sem MTP foram medidos depois
+> (ver a tarefa 6 acima e `docs/decode-por-configuracao.md`).
 
 | O quê | Como medir |
 |---|---|

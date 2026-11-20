@@ -4,6 +4,8 @@
 
 Data: **25/09/2026**. Revisão analisada: `5206197cd4a4804dc0f08d6fba0c86075a6f50be`.
 
+> **Atualização 2026-11-20:** E01 e E02 (`0603b5a`), E03 e E05 (`6b6f5e1`, `5a45b8c`), E06 (`5da9f21`) e o MTP no README (E09, `b4dd4ea`) já foram corrigidos; seguem abertos E04, E07, E08 e E10. O bloco de prefill padrão hoje é 256 (32 se o modelo tiver tipo sem GEMM), não 24.
+
 ## 1. Diagnóstico e escopo
 
 O projeto tem uma proposta técnica coerente: controlar a inferência em Rust e os kernels Vulkan para extrair desempenho de GPUs AMD gfx906. A separação em crates, os testes diferenciais e o registro de experimentos dão uma boa base para continuar. **A prioridade recomendada é tornar esse runtime especializado confiável para o uso local com agentes, mantendo o foco nas MI50/MI60.**
