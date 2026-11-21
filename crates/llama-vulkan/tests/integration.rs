@@ -2222,3 +2222,61 @@ fn bancada_atencao_gqa() {
         );
     }
 }
+
+/// O `atencao_bloco.comp` bate com o split16 (o caminho do decode, já validado) num bloco de
+/// prefill com a geometria do Qwen3.8-35B-A3B, e imprime o tempo do kernel do bloco.
+/// `LLAMA_RS_BLOCO_LEN=16384,30720` troca os comprimentos medidos.
+#[test]
+#[ignore = "ocupa a GPU por segundos; rodar com o pstate fixo para medir"]
+fn atencao_bloco_bate_com_split16() {
+    use llama_vulkan::{ResidentForward, VulkanContext};
+
+    let Ok(ctx) = VulkanContext::new() else {
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        return;
+    }
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+    let (n_head, n_head_kv, head_dim, n_tok) = (16usize, 2usize, 256usize, 256usize);
+    let lens: Vec<usize> = std::env::var("LLAMA_RS_BLOCO_LEN")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![2048, 16384, 30720]);
+    let kv_dim = n_head_kv * head_dim;
+    for total_len in lens {
+        let q: Vec<f32> = (0..n_tok * n_head * head_dim)
+            .map(|i| ((i % 19) as f32) * 0.05 - 0.4)
+            .collect();
+        let kc: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| ((i % 23) as f32) * 0.03 - 0.3)
+            .collect();
+        let vc: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| ((i % 29) as f32) * 0.02 - 0.2)
+            .collect();
+        let (out, t) = fwd
+            .dbg_atencao_bloco(
+                &q, &kc, &vc, n_head, n_head_kv, head_dim, total_len, n_tok, 10,
+            )
+            .unwrap();
+        let refer = fwd
+            .dbg_attention_split(
+                &q, &kc, &vc, n_head, n_head_kv, head_dim, total_len, n_tok, 16,
+            )
+            .unwrap();
+        let erro = out
+            .iter()
+            .zip(&refer)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        // FMA do produto Q·K e de P·V: 2 × 2 × head_dim por (linha, posição), metade em média
+        // por causa da máscara causal (desprezível com total_len ≫ n_tok).
+        let flops = 4.0 * (n_tok * n_head * head_dim) as f64 * total_len as f64;
+        eprintln!(
+            "total_len={total_len}: {:.2} ms | {:.0} GFLOP/s | erro máx {erro:.2e}",
+            t * 1e3,
+            flops / t / 1e9
+        );
+        assert!(erro < 1e-3, "atencao_bloco diverge do split16: {erro}");
+    }
+}

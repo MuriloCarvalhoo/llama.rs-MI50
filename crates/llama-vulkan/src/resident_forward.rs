@@ -934,8 +934,8 @@ impl PlannedOp {
     }
 }
 
-/// Linhas de query por workgroup do `atencao_bloco.comp` (16 grupos de 16 lanes × 2 linhas).
-const ATENCAO_BLOCO_LINHAS: usize = 32;
+/// Linhas de query por workgroup do `atencao_bloco.comp` (32 grupos de 8 lanes × 2 linhas).
+const ATENCAO_BLOCO_LINHAS: usize = 64;
 
 /// Tokens do bloco que um workgroup do `atencao_bloco.comp` cobre, quando a geometria serve:
 /// head_dim 256, `n_rep` par e o bloco múltiplo desses tokens.
@@ -2725,6 +2725,91 @@ impl<'ctx> ResidentForward<'ctx> {
         parciais.destroy(d);
         ob.destroy(d);
         Ok(media)
+    }
+
+    /// Atenção do bloco de prefill (`atencao_bloco.comp` + `attn_reduce`) sobre `n_tokens`
+    /// tokens que terminam em `total_len`, com as fatias que o plano escolheria. Devolve a
+    /// saída `[n_tokens][n_head][head_dim]` e o tempo médio de `reps` dispatches do kernel
+    /// do bloco (sem a redução e sem o upload).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dbg_atencao_bloco(
+        &self,
+        q: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        total_len: usize,
+        n_tokens: usize,
+        reps: usize,
+    ) -> Result<(Vec<f32>, f64), MatmulError> {
+        let Some(tt) = atencao_bloco_serve(head_dim, n_head, n_head_kv, n_tokens) else {
+            return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+        };
+        let bytes = |v: &[usize]| -> Vec<u8> {
+            v.iter()
+                .flat_map(|&x| u32::try_from(x).unwrap_or(u32::MAX).to_le_bytes())
+                .collect()
+        };
+        let d = &self.dev.device;
+        let kv_dim = n_head_kv * head_dim;
+        let nb = |n: usize| (n * 4) as vk::DeviceSize;
+        let grupos_y = n_tokens / tt;
+        let n_split = splits_do_bloco(
+            u32::try_from(total_len).unwrap_or(u32::MAX),
+            u32::try_from(n_head_kv * grupos_y).unwrap_or(u32::MAX),
+        ) as usize;
+        let kc = Self::empacota_kv(k_cache);
+        let vc = Self::empacota_kv(v_cache);
+        let qb = Buf::device(self.ctx, self.phys(), d, nb(q.len()))?;
+        let kb = Buf::device(self.ctx, self.phys(), d, nb(kc.len()))?;
+        let vb = Buf::device(self.ctx, self.phys(), d, nb(vc.len()))?;
+        let parciais = Buf::device(
+            self.ctx,
+            self.phys(),
+            d,
+            nb(n_tokens * n_head * n_split * (head_dim + 2)),
+        )?;
+        let ob = Buf::device(self.ctx, self.phys(), d, nb(n_tokens * n_head * head_dim))?;
+        self.upload_f32(&qb, q)?;
+        self.upload_f32(&kb, &kc)?;
+        self.upload_f32(&vb, &vc)?;
+
+        let pb = bytes(&[n_head, n_head_kv, head_dim, total_len, kv_dim, 0, head_dim]);
+        let set = self.alloc_set(&self.atencao_bloco)?;
+        let binds = [
+            (qb.buffer, 0, qb.size),
+            (kb.buffer, 0, kb.size),
+            (vb.buffer, 0, vb.size),
+            (parciais.buffer, 0, parciais.size),
+        ];
+        let (gx, gy, gz) = (n_head_kv as u32, grupos_y as u32, n_split as u32);
+        self.dispatch_xyz(&self.atencao_bloco, set, &binds, &pb, gx, gy, gz)?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps.max(1) {
+            self.dispatch_xyz(&self.atencao_bloco, set, &binds, &pb, gx, gy, gz)?;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let media = t0.elapsed().as_secs_f64() / reps.max(1) as f64;
+
+        let rb = bytes(&[n_head, head_dim, n_split]);
+        let set_r = self.alloc_set(&self.attn_reduce)?;
+        self.dispatch_xy(
+            &self.attn_reduce,
+            set_r,
+            &[(parciais.buffer, 0, parciais.size), (ob.buffer, 0, ob.size)],
+            &rb,
+            n_head as u32,
+            n_tokens as u32,
+        )?;
+        let out = self.readback(&ob, n_tokens * n_head * head_dim)?;
+        qb.destroy(d);
+        kb.destroy(d);
+        vb.destroy(d);
+        parciais.destroy(d);
+        ob.destroy(d);
+        Ok((out, media))
     }
 
     /// Emite as ops de uma camada de atenção linear (qwen35), deixando o resultado em
