@@ -21,23 +21,39 @@ sem MTP.
 Prefill: o llama.cpp é ~1,85× mais rápido (318 contra 171,9 tok/s com 7,5k, desde o bloco de
 256). O snapshot na fronteira do turno (`1769c35`) levou o TTFT com 30k de 387 s para 31,5 s.
 
-## Qwen3.8-35B-A3B (MoE, 256 experts, top-8), 2× MI50 layer-split (2026-11-20)
+## Qwen3.8-35B-A3B (MoE, 256 experts, top-8), 2× MI50 layer-split (2026-11-21)
 
 `Qwen3.8-35B-A3B-Distill.APEX-I-MiniPlus-V2.1-Abliterated.gguf` (Q3_K + IQ3_XXS, 13,6 GiB),
-prompts de código (fontes Rust do repo), frio, 512 tokens gerados, 1 execução por ponto.
-O llama.cpp é o build Vulkan `b3112-0c43822bf`, sem especulação.
+prompts de código (fontes Rust do repo), frio, 512 tokens gerados, 1 execução por ponto,
+ctx 128k, divisão 25/15 por potência. O llama.cpp é o build Vulkan `b3112-0c43822bf`, sem
+especulação, nas duas GPUs.
 
 | Contexto | Prefill llama.rs | Prefill llama.cpp | Decode llama.rs | Decode llama.cpp |
 |---:|---:|---:|---:|---:|
-| 2k | 379 | 864 | **102,8** | 44,9 |
-| 8k | 340 | 1133 | **94,0** | 44,3 |
-| 16k | 286 | 1105 | **84,2** | 42,5 |
-| 30k | 224 | 937 | **71,1** | 39,7 |
+| 2k | **1250** | 864 | **103,7** | 44,9 |
+| 8k | **1407** | 1133 | **94,5** | 44,3 |
+| 16k | **1274** | 1105 | **84,7** | 42,5 |
+| 30k | **1064** | 937 | **71,5** | 39,7 |
+
+O prefill era 379/340/286/224 em 2026-11-20. O que levou até aqui, em ordem de ganho:
+pipeline entre as GPUs (`prefill_blocos`, a GPU1 no bloco k enquanto a GPU0 roda o k+1),
+experts agrupados por expert (`moe_contar` + `moe_agrupado`), bloco de 256 (GEMM Q8_0),
+atenção com o KV compartilhado pelo tile de Q (`atencao_bloco`), divisão das camadas pela
+potência das placas, roteador com o peso lido uma vez a cada 8 tokens, resto em blocos de
+128/64/32.
+
+Op por op contra o llama.cpp na mesma placa (GPU0, `GGML_VK_PERF_LOGGER`, 40 camadas, 512
+tokens): experts 219 contra 293 ms, Q3_K denso 96 contra 105, compartilhado 22 contra 35;
+mais lentos o delta-net (57 contra 19 ms) e a atenção em ~4k (~74 contra ~38 ms).
 
 Saída conferida por teacher forcing contra o llama.cpp: top-1 igual em 47/48 (prompt curto)
 e 46/48 (2k), |Δ logprob| médio 0,02–0,06; as divergências são decisões apertadas.
 
 ## Qwen3.8-27B (híbrido atenção + gated delta-net), 2× MI50 layer-split
+
+Em 2026-11-21, com o pipeline e a divisão por potência (41/23): prefill 286/294 tok/s em
+prompts de código de 2k/8k (eram 170/153), decode com MTP 36,5/29,7.
+
 
 | Config | tok/s |
 |---|---:|
