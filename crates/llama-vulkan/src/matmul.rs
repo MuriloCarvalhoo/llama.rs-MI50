@@ -88,12 +88,10 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
         let size = bytes_of.len() as vk::DeviceSize;
         let staging = create_buf(d, size, vk::BufferUsageFlags::TRANSFER_SRC)?;
         let staging_mem = alloc_and_bind(ctx, phys, d, staging, true)?;
-        unsafe {
-            // SAFETY: staging_mem é host-visible com `size`; ptr válido até unmap.
-            let ptr = d.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())?;
-            std::ptr::copy_nonoverlapping(bytes_of.as_ptr(), ptr.cast::<u8>(), bytes_of.len());
-            d.unmap_memory(staging_mem);
-        }
+        // staging_mem é host-visible com `size`.
+        d.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())?
+            .escrever(bytes_of);
+        d.unmap_memory(staging_mem);
         let buf = create_buf(
             d,
             size,
@@ -101,21 +99,14 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
         )?;
         let mem = alloc_and_bind(ctx, phys, d, buf, false)?;
         one_shot_copy(d, dev.queue, dev.cmd_pool, staging, buf, size)?;
-        unsafe {
-            // SAFETY: staging já copiado; ambos criados por nós.
-            d.destroy_buffer(staging, None);
-            d.free_memory(staging_mem, None);
-        }
+        // staging já copiado; ambos criados por nós.
+        d.destroy_buffer(staging, None);
+        d.free_memory(staging_mem, None);
         Ok((buf, mem))
     };
 
-    // SAFETY: Vec<u32>/Vec<f32> são POD contíguos; reinterpretar como bytes é válido.
-    let xq_bytes = unsafe {
-        std::slice::from_raw_parts(xq.as_ptr().cast::<u8>(), std::mem::size_of_val(&xq[..]))
-    };
-    let xd_bytes = unsafe {
-        std::slice::from_raw_parts(xd.as_ptr().cast::<u8>(), std::mem::size_of_val(&xd[..]))
-    };
+    let xq_bytes: &[u8] = bytemuck::cast_slice(&xq);
+    let xd_bytes: &[u8] = bytemuck::cast_slice(&xd);
     let (xq_buf, xq_mem) = upload(xq_bytes)?;
     let (xd_buf, xd_mem) = upload(xd_bytes)?;
     let xq_size = xq_bytes.len() as vk::DeviceSize;
@@ -143,8 +134,8 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
         p_pool_sizes: pool_sizes.as_ptr(),
         ..Default::default()
     };
-    // SAFETY: d é válido; pool_info aponta para dados válidos na stack frame.
-    let desc_pool = unsafe { d.create_descriptor_pool(&pool_info, None)? };
+    // d é válido; pool_info aponta para dados válidos na stack frame.
+    let desc_pool = d.create_descriptor_pool(&pool_info, None)?;
 
     let alloc_info = vk::DescriptorSetAllocateInfo {
         descriptor_pool: desc_pool,
@@ -152,8 +143,8 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
         p_set_layouts: &pipe.desc_set_layout,
         ..Default::default()
     };
-    // SAFETY: d e desc_pool são válidos; alloc_info aponta para dados válidos.
-    let desc_sets = unsafe { d.allocate_descriptor_sets(&alloc_info)? };
+    // d e desc_pool são válidos; alloc_info aponta para dados válidos.
+    let desc_sets = d.allocate_descriptor_sets(&alloc_info)?;
     let desc_set = desc_sets[0];
 
     // Escrever descriptors: 0=weights, 1=x quantizado, 2=escalas de x, 3=output, 4=bias.
@@ -201,8 +192,8 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
         })
         .collect();
 
-    // SAFETY: d é válido; writes aponta para dados válidos na stack frame.
-    unsafe { d.update_descriptor_sets(&writes, &[]) };
+    // d é válido; writes aponta para dados válidos na stack frame.
+    d.update_descriptor_sets(&writes, &[]);
 
     // 5. Command buffer: bind pipeline → bind descriptor set → push constants → cmd_dispatch
     let cb_alloc_info = vk::CommandBufferAllocateInfo {
@@ -211,8 +202,8 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
         command_buffer_count: 1,
         ..Default::default()
     };
-    // SAFETY: d e cmd_pool são válidos.
-    let cmd_bufs = unsafe { d.allocate_command_buffers(&cb_alloc_info)? };
+    // d e cmd_pool são válidos.
+    let cmd_bufs = d.allocate_command_buffers(&cb_alloc_info)?;
     let cmd = cmd_bufs[0];
 
     let begin_info = vk::CommandBufferBeginInfo {
@@ -227,79 +218,62 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
         tem_bias: 0,
     };
 
-    unsafe {
-        // SAFETY: cmd é válido e recém alocado.
-        d.begin_command_buffer(cmd, &begin_info)?;
+    // cmd é válido e recém alocado.
+    d.begin_command_buffer(cmd, &begin_info)?;
 
-        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe.pipeline);
-        d.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            pipe.layout,
-            0,
-            &[desc_set],
-            &[],
-        );
-        d.cmd_push_constants(
-            cmd,
-            pipe.layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            // SAFETY: PushConstants é #[repr(C)] com 3×u32; o slice de bytes é válido.
-            std::slice::from_raw_parts(
-                &push as *const PushConstants as *const u8,
-                std::mem::size_of::<PushConstants>(),
-            ),
-        );
-        // Cada workgroup computa 1 linha de output
-        d.cmd_dispatch(cmd, n_out_local as u32, 1, 1);
+    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe.pipeline);
+    d.cmd_bind_descriptor_sets(
+        cmd,
+        vk::PipelineBindPoint::COMPUTE,
+        pipe.layout,
+        0,
+        &[desc_set],
+        &[],
+    );
+    d.cmd_push_constants(
+        cmd,
+        pipe.layout,
+        vk::ShaderStageFlags::COMPUTE,
+        0,
+        bytemuck::bytes_of(&push),
+    );
+    // Cada workgroup computa 1 linha de output
+    d.cmd_dispatch(cmd, n_out_local as u32, 1, 1);
 
-        d.end_command_buffer(cmd)?;
-    }
-
+    d.end_command_buffer(cmd)?;
     // 6. Submit → wait_idle
     let submit_info = vk::SubmitInfo {
         command_buffer_count: 1,
         p_command_buffers: &cmd,
         ..Default::default()
     };
-    unsafe {
-        // SAFETY: queue, submit_info e cmd são válidos.
-        d.queue_submit(dev.queue, &[submit_info], vk::Fence::null())?;
-        d.queue_wait_idle(dev.queue)?;
-        d.free_command_buffers(dev.cmd_pool, &[cmd]);
-    }
-
+    // queue, submit_info e cmd são válidos.
+    d.queue_submit(dev.queue, &[submit_info], vk::Fence::null())?;
+    d.queue_wait_idle(dev.queue)?;
+    d.free_command_buffers(dev.cmd_pool, &[cmd]);
     // Readback Y via buffer staging TRANSFER_DST | HOST_VISIBLE | HOST_COHERENT
     let y_read_buf = create_buf(d, y_size, vk::BufferUsageFlags::TRANSFER_DST)?;
     let y_read_mem = alloc_and_bind(ctx, phys, d, y_read_buf, true)?;
     one_shot_copy(d, dev.queue, dev.cmd_pool, y_buf, y_read_buf, y_size)?;
 
-    let result = unsafe {
-        // SAFETY: y_read_mem é host-visible com tamanho y_size; ptr é válido até unmap.
-        let ptr = d.map_memory(y_read_mem, 0, y_size, vk::MemoryMapFlags::empty())?;
-        let mut out = vec![0f32; n_out_local];
-        std::ptr::copy_nonoverlapping(ptr as *const f32, out.as_mut_ptr(), n_out_local);
-        d.unmap_memory(y_read_mem);
-        out
-    };
+    // y_read_mem é host-visible com tamanho y_size.
+    let result = d
+        .map_memory(y_read_mem, 0, y_size, vk::MemoryMapFlags::empty())?
+        .ler::<f32>(n_out_local);
+    d.unmap_memory(y_read_mem);
 
     // 7. Cleanup de todos os recursos Vulkan
-    unsafe {
-        d.destroy_buffer(y_read_buf, None);
-        d.free_memory(y_read_mem, None);
-    }
+    d.destroy_buffer(y_read_buf, None);
+    d.free_memory(y_read_mem, None);
     pipe.destroy(d);
-    unsafe {
-        // SAFETY: desc_pool foi criado por nós; os descriptor sets são destruídos com o pool.
-        d.destroy_descriptor_pool(desc_pool, None);
-        d.destroy_buffer(y_buf, None);
-        d.free_memory(y_mem, None);
-        d.destroy_buffer(xq_buf, None);
-        d.free_memory(xq_mem, None);
-        d.destroy_buffer(xd_buf, None);
-        d.free_memory(xd_mem, None);
-    }
+    // desc_pool foi criado por nós; os descriptor sets são destruídos com o pool.
+    d.destroy_descriptor_pool(desc_pool, None);
+    d.destroy_buffer(y_buf, None);
+    d.free_memory(y_mem, None);
+    d.destroy_buffer(xq_buf, None);
+    d.free_memory(xq_mem, None);
+    d.destroy_buffer(xd_buf, None);
+    d.free_memory(xd_mem, None);
     w_tensor.destroy(d);
 
     Ok(result)
@@ -826,12 +800,10 @@ fn dispatch_k_matvec_ext(
         let size = bytes.len() as vk::DeviceSize;
         let staging = create_buf(d, size, vk::BufferUsageFlags::TRANSFER_SRC)?;
         let staging_mem = alloc_and_bind(ctx, phys, d, staging, true)?;
-        unsafe {
-            // SAFETY: staging_mem é host-visible com `size`; ptr válido até unmap.
-            let ptr = d.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())?;
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
-            d.unmap_memory(staging_mem);
-        }
+        // staging_mem é host-visible com `size`.
+        d.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())?
+            .escrever(bytes);
+        d.unmap_memory(staging_mem);
         let buf = create_buf(
             d,
             size,
@@ -839,11 +811,9 @@ fn dispatch_k_matvec_ext(
         )?;
         let mem = alloc_and_bind(ctx, phys, d, buf, false)?;
         one_shot_copy(d, dev.queue, dev.cmd_pool, staging, buf, size)?;
-        unsafe {
-            // SAFETY: staging já copiado; ambos criados por nós.
-            d.destroy_buffer(staging, None);
-            d.free_memory(staging_mem, None);
-        }
+        // staging já copiado; ambos criados por nós.
+        d.destroy_buffer(staging, None);
+        d.free_memory(staging_mem, None);
         Ok((buf, mem))
     };
 
@@ -851,16 +821,12 @@ fn dispatch_k_matvec_ext(
     // Os shaders K-quant consomem a ativação em int8, como o caminho Q8_0: o sub-bloco de
     // 32 elementos do K-quant coincide com o bloco de quantização.
     let (xq, xd) = crate::tensor::quantize_x_host(x_f32);
-    // SAFETY: Vec<u32>/Vec<f32> são POD contíguos; reinterpretar como bytes é válido.
-    let xq_bytes = unsafe { std::slice::from_raw_parts(xq.as_ptr().cast::<u8>(), xq.len() * 4) };
-    let xd_bytes = unsafe { std::slice::from_raw_parts(xd.as_ptr().cast::<u8>(), xd.len() * 4) };
+    let xq_bytes: &[u8] = bytemuck::cast_slice(&xq);
+    let xd_bytes: &[u8] = bytemuck::cast_slice(&xd);
     let (xq_buf, xq_mem) = upload(xq_bytes)?;
     let (xd_buf, xd_mem) = upload(xd_bytes)?;
     let ids = match extra.ids {
-        // SAFETY: Vec<u32> POD contíguo, reinterpretado como bytes.
-        Some(v) => Some(upload(unsafe {
-            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), v.len() * 4)
-        })?),
+        Some(v) => Some(upload(bytemuck::cast_slice(v))?),
         None => None,
     };
 
@@ -891,16 +857,16 @@ fn dispatch_k_matvec_ext(
         p_pool_sizes: pool_sizes.as_ptr(),
         ..Default::default()
     };
-    // SAFETY: d válido; pool_info aponta para dados vivos nesta frame.
-    let desc_pool = unsafe { d.create_descriptor_pool(&pool_info, None)? };
+    // d válido; pool_info aponta para dados vivos nesta frame.
+    let desc_pool = d.create_descriptor_pool(&pool_info, None)?;
     let set_alloc = vk::DescriptorSetAllocateInfo {
         descriptor_pool: desc_pool,
         descriptor_set_count: 1,
         p_set_layouts: &pipe.desc_set_layout,
         ..Default::default()
     };
-    // SAFETY: pool e layout válidos.
-    let desc_set = unsafe { d.allocate_descriptor_sets(&set_alloc)? }[0];
+    // pool e layout válidos.
+    let desc_set = d.allocate_descriptor_sets(&set_alloc)?[0];
 
     let infos = [
         vk::DescriptorBufferInfo {
@@ -948,8 +914,8 @@ fn dispatch_k_matvec_ext(
             ..Default::default()
         })
         .collect();
-    // SAFETY: writes aponta para `infos`, vivo nesta frame.
-    unsafe { d.update_descriptor_sets(&writes, &[]) };
+    // writes aponta para `infos`, vivo nesta frame.
+    d.update_descriptor_sets(&writes, &[]);
 
     let cb_alloc = vk::CommandBufferAllocateInfo {
         command_pool: dev.cmd_pool,
@@ -957,8 +923,8 @@ fn dispatch_k_matvec_ext(
         command_buffer_count: 1,
         ..Default::default()
     };
-    // SAFETY: device e pool válidos; cmd gravado e liberado aqui.
-    let out = unsafe {
+    // device e pool válidos; cmd gravado e liberado aqui.
+    let out = {
         let cmd = d.allocate_command_buffers(&cb_alloc)?[0];
         d.begin_command_buffer(
             cmd,
@@ -981,10 +947,7 @@ fn dispatch_k_matvec_ext(
             pipe.layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
-            std::slice::from_raw_parts(
-                std::ptr::from_ref(&push).cast::<u8>(),
-                size_of::<PushConstants>(),
-            ),
+            bytemuck::bytes_of(&push),
         );
         // O GEMM fatia blocos maiores que 32 em tiles de 32 colunas, um por grupo em Y; os
         // matvec-COLS nunca passam de 32, então para eles isto é 1.
@@ -1005,9 +968,9 @@ fn dispatch_k_matvec_ext(
         let read = create_buf(d, y_size, vk::BufferUsageFlags::TRANSFER_DST)?;
         let read_mem = alloc_and_bind(ctx, phys, d, read, true)?;
         one_shot_copy(d, dev.queue, dev.cmd_pool, y_buf, read, y_size)?;
-        let ptr = d.map_memory(read_mem, 0, y_size, vk::MemoryMapFlags::empty())?;
-        let mut v = vec![0f32; extra.saida_floats];
-        std::ptr::copy_nonoverlapping(ptr.cast::<f32>(), v.as_mut_ptr(), extra.saida_floats);
+        let v = d
+            .map_memory(read_mem, 0, y_size, vk::MemoryMapFlags::empty())?
+            .ler::<f32>(extra.saida_floats);
         d.unmap_memory(read_mem);
         d.destroy_buffer(read, None);
         d.free_memory(read_mem, None);
@@ -1015,21 +978,19 @@ fn dispatch_k_matvec_ext(
         Ok(v)
     };
 
-    unsafe {
-        // SAFETY: GPU ociosa após o readback; handles criados por nós.
-        pipe.destroy(d);
-        d.destroy_buffer(w_buf, None);
-        d.free_memory(w_mem, None);
-        if let Some((b, m)) = ids {
-            d.destroy_buffer(b, None);
-            d.free_memory(m, None);
-        }
-        d.destroy_buffer(xq_buf, None);
-        d.free_memory(xq_mem, None);
-        d.destroy_buffer(xd_buf, None);
-        d.free_memory(xd_mem, None);
-        d.destroy_buffer(y_buf, None);
-        d.free_memory(y_mem, None);
+    // GPU ociosa após o readback; handles criados por nós.
+    pipe.destroy(d);
+    d.destroy_buffer(w_buf, None);
+    d.free_memory(w_mem, None);
+    if let Some((b, m)) = ids {
+        d.destroy_buffer(b, None);
+        d.free_memory(m, None);
     }
+    d.destroy_buffer(xq_buf, None);
+    d.free_memory(xq_mem, None);
+    d.destroy_buffer(xd_buf, None);
+    d.free_memory(xd_mem, None);
+    d.destroy_buffer(y_buf, None);
+    d.free_memory(y_mem, None);
     out
 }

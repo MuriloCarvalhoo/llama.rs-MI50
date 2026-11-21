@@ -1,5 +1,5 @@
-use ash::{Entry, Instance, vk};
-use std::ffi::CStr;
+use crate::ffi::{Device, Instance};
+use ash::{Entry, vk};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -145,16 +145,13 @@ impl VulkanPhysicalDevice {
 
     /// `(usada pelo processo, livre para ele)` nos heaps DEVICE_LOCAL.
     fn orcamento_vram(&self, ctx: &VulkanContext) -> Option<(u64, u64)> {
-        let exts = unsafe {
-            ctx.instance
-                .enumerate_device_extension_properties(self.handle)
-        }
-        .ok()?;
-        let has_budget = exts.iter().any(|e| {
-            // SAFETY: extension_name é nul-terminado pela spec Vulkan.
-            let n = unsafe { CStr::from_ptr(e.extension_name.as_ptr()) };
-            n.to_bytes() == b"VK_EXT_memory_budget"
-        });
+        let exts = ctx
+            .instance
+            .enumerate_device_extension_properties(self.handle)
+            .ok()?;
+        let has_budget = exts
+            .iter()
+            .any(|e| e.extension_name_as_c_str() == Ok(c"VK_EXT_memory_budget"));
         if !has_budget {
             return None;
         }
@@ -163,11 +160,9 @@ impl VulkanPhysicalDevice {
             p_next: std::ptr::from_mut(&mut budget).cast(),
             ..Default::default()
         };
-        // SAFETY: handle válido; p_next aponta para `budget`, vivo durante a chamada.
-        unsafe {
-            ctx.instance
-                .get_physical_device_memory_properties2(self.handle, &mut props2)
-        };
+        // p_next aponta para `budget`, vivo durante a chamada.
+        ctx.instance
+            .get_physical_device_memory_properties2(self.handle, &mut props2);
         let mem = props2.memory_properties;
         let mut free = 0u64;
         let mut usada = 0u64;
@@ -189,9 +184,7 @@ impl VulkanPhysicalDevice {
 
 impl VulkanContext {
     pub fn new() -> Result<Self, VulkanError> {
-        // SAFETY: carrega biblioteca Vulkan dinamicamente via ash; nenhum invariante de
-        // memória é violado — a função apenas dlopen/LoadLibrary a lib do sistema.
-        let entry = unsafe { Entry::load().map_err(|_| VulkanError::LibraryLoad)? };
+        let entry = crate::ffi::carregar_entry().map_err(|_| VulkanError::LibraryLoad)?;
 
         let app_info = vk::ApplicationInfo {
             api_version: vk::make_api_version(0, 1, 1, 0), // Vulkan 1.1 para subgroup ops
@@ -201,13 +194,8 @@ impl VulkanContext {
             p_application_info: &app_info,
             ..Default::default()
         };
-        // SAFETY: `app_info` e `create_info` são referências válidas na mesma stack frame;
-        // ambas vivem até `create_instance` retornar, satisfazendo os requisitos de lifetime do FFI.
-        let instance = unsafe {
-            entry
-                .create_instance(&create_info, None)
-                .map_err(VulkanError::InstanceCreate)?
-        };
+        let instance = crate::ffi::create_instance(&entry, &create_info)
+            .map_err(VulkanError::InstanceCreate)?;
 
         let physical_devices = Self::enumerate_amd_devices(&instance)?;
         Ok(Self {
@@ -224,20 +212,17 @@ impl VulkanContext {
     fn enumerate_amd_devices(
         instance: &Instance,
     ) -> Result<Vec<VulkanPhysicalDevice>, VulkanError> {
-        // SAFETY: `instance` é válida — foi criada com sucesso pela função chamadora.
-        let phys_devs = unsafe { instance.enumerate_physical_devices()? };
+        let phys_devs = instance.enumerate_physical_devices()?;
         let mut result = Vec::new();
         let mut monitores = Vec::new();
 
         for pd in phys_devs {
-            // SAFETY: `pd` é um handle válido retornado por `enumerate_physical_devices`.
-            let props = unsafe { instance.get_physical_device_properties(pd) };
+            let props = instance.get_physical_device_properties(pd);
             if props.vendor_id != AMD_VENDOR_ID {
                 continue;
             }
 
-            // SAFETY: `pd` é um handle válido retornado por `enumerate_physical_devices`.
-            let qfams = unsafe { instance.get_physical_device_queue_family_properties(pd) };
+            let qfams = instance.get_physical_device_queue_family_properties(pd);
             let Some(qfam_idx) = qfams
                 .iter()
                 .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
@@ -246,14 +231,11 @@ impl VulkanContext {
             };
 
             // A struct de PCI só pode entrar na cadeia se o device anunciar a extensão.
-            // SAFETY: `pd` é um handle válido retornado por `enumerate_physical_devices`.
-            let tem_pci_info = unsafe { instance.enumerate_device_extension_properties(pd) }
+            let tem_pci_info = instance
+                .enumerate_device_extension_properties(pd)
                 .is_ok_and(|exts| {
-                    exts.iter().any(|e| {
-                        // SAFETY: extension_name é nul-terminado pela spec Vulkan.
-                        let n = unsafe { CStr::from_ptr(e.extension_name.as_ptr()) };
-                        n.to_bytes() == b"VK_EXT_pci_bus_info"
-                    })
+                    exts.iter()
+                        .any(|e| e.extension_name_as_c_str() == Ok(c"VK_EXT_pci_bus_info"))
                 });
             let mut pci_props = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
             let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::default();
@@ -264,10 +246,9 @@ impl VulkanContext {
                 p_next: &mut subgroup_props as *mut _ as *mut std::ffi::c_void,
                 ..Default::default()
             };
-            // SAFETY: `pd` é válido; `p_next` aponta para `subgroup_props` (e este, com a
-            // extensão, para `pci_props`), que vivem na mesma stack frame durante toda a
-            // chamada, satisfazendo o requisito de validade do ponteiro.
-            unsafe { instance.get_physical_device_properties2(pd, &mut props2) };
+            // `p_next` aponta para `subgroup_props` (e este, com a extensão, para
+            // `pci_props`), que vivem na mesma stack frame durante toda a chamada.
+            instance.get_physical_device_properties2(pd, &mut props2);
             let pci = tem_pci_info.then(|| {
                 format!(
                     "{:04x}:{:02x}:{:02x}.{:x}",
@@ -282,14 +263,10 @@ impl VulkanContext {
                 .and_then(|pci| tem_monitor(std::path::Path::new("/sys/bus/pci/devices"), pci));
             monitores.push(monitor);
 
-            // SAFETY: `device_name` é garantido nul-terminado pela spec Vulkan
-            // (VkPhysicalDeviceProperties.deviceName tem VK_MAX_PHYSICAL_DEVICE_NAME_SIZE bytes
-            // com nul terminator obrigatório).
-            let name = unsafe {
-                CStr::from_ptr(props.device_name.as_ptr())
-                    .to_string_lossy()
-                    .into_owned()
-            };
+            let name = props
+                .device_name_as_c_str()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             result.push(VulkanPhysicalDevice {
                 handle: pd,
                 name,
@@ -309,14 +286,14 @@ impl VulkanContext {
 
 impl Drop for VulkanContext {
     fn drop(&mut self) {
-        // SAFETY: instance foi criada por nós e não foi destruída antes.
-        unsafe { self.instance.destroy_instance(None) };
+        // instance foi criada por nós e não foi destruída antes.
+        self.instance.destroy_instance(None);
     }
 }
 
 /// Device lógico Vulkan + fila de compute + command pool.
 pub struct VulkanDevice {
-    pub(crate) device: ash::Device,
+    pub(crate) device: Device,
     #[allow(dead_code)] // usado em tasks futuras (dispatch de compute)
     pub(crate) queue: vk::Queue,
     pub(crate) cmd_pool: vk::CommandPool,
@@ -325,8 +302,8 @@ pub struct VulkanDevice {
 }
 
 impl VulkanDevice {
-    /// Retorna referencia ao `ash::Device` logico.
-    pub fn as_device(&self) -> &ash::Device {
+    /// Retorna referencia ao device logico.
+    pub fn as_device(&self) -> &Device {
         &self.device
     }
 
@@ -343,28 +320,22 @@ impl VulkanDevice {
             p_queue_create_infos: &queue_info,
             ..Default::default()
         };
-        // SAFETY: `phys.handle` é um handle válido retornado por `enumerate_physical_devices`;
         // `create_info` e `queue_info` vivem na mesma stack frame até a chamada retornar.
-        let device = unsafe {
-            ctx.instance
-                .create_device(phys.handle, &create_info, None)?
-        };
-        // SAFETY: `device` foi criado com sucesso acima; queue_family e index 0 são válidos
-        // pois foram verificados durante a enumeração dos physical devices.
-        let queue = unsafe { device.get_device_queue(phys.queue_family, 0) };
+        let device = ctx.instance.create_device(phys.handle, &create_info)?;
+        // queue_family e index 0 foram verificados durante a enumeração dos physical devices.
+        let queue = device.get_device_queue(phys.queue_family, 0);
         let pool_info = vk::CommandPoolCreateInfo {
             queue_family_index: phys.queue_family,
             flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
             ..Default::default()
         };
-        // SAFETY: `device` é válido e `pool_info` aponta para dados válidos na stack frame atual.
-        let cmd_pool = match unsafe { device.create_command_pool(&pool_info, None) } {
+        let cmd_pool = match device.create_command_pool(&pool_info, None) {
             Ok(p) => p,
             Err(e) => {
                 // O `Drop` que destruiria o device ainda não existe: destruí-lo aqui, senão
                 // ele sobra até o fim do processo.
-                // SAFETY: device criado acima, sem nenhum objeto filho vivo.
-                unsafe { device.destroy_device(None) };
+                // device criado acima, sem nenhum objeto filho vivo.
+                device.destroy_device(None);
                 return Err(e);
             }
         };
@@ -379,11 +350,9 @@ impl VulkanDevice {
 
 impl Drop for VulkanDevice {
     fn drop(&mut self) {
-        // SAFETY: cmd_pool e device foram criados por nós nesta ordem.
-        unsafe {
-            self.device.destroy_command_pool(self.cmd_pool, None);
-            self.device.destroy_device(None);
-        }
+        // cmd_pool e device foram criados por nós nesta ordem.
+        self.device.destroy_command_pool(self.cmd_pool, None);
+        self.device.destroy_device(None);
     }
 }
 

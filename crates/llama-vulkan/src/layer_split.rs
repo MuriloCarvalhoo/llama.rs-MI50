@@ -20,17 +20,6 @@ pub struct LayerSplitForward<'ctx> {
     shards: Vec<ResidentForward<'ctx>>,
 }
 
-/// Shard recém-construído, a caminho da thread que vai usá-lo.
-///
-/// O `ResidentForward` guarda o ponteiro da memória mapeada dos logits, e ponteiro cru não
-/// é `Send`. Durante a carga o shard ainda não foi usado por ninguém — nenhum command
-/// buffer gravado, nenhuma referência viva ao mapa —, então movê-lo da thread que o
-/// construiu para a que vai usá-lo é seguro.
-struct EnviaShard<'ctx>(ResidentForward<'ctx>);
-// SAFETY: ver acima — a transferência acontece antes de qualquer uso concorrente, e o
-// ponteiro mapeado só é lido pela thread dona depois disso.
-unsafe impl Send for EnviaShard<'_> {}
-
 impl<'ctx> LayerSplitForward<'ctx> {
     /// Divide `config.n_layer` entre os devices **proporcionalmente à VRAM livre**, como o
     /// llama.cpp faz em `llama_model::load_tensors`. Divisão por contagem igual seria pior
@@ -144,7 +133,6 @@ impl<'ctx> LayerSplitForward<'ctx> {
                             },
                             mtp,
                         )
-                        .map(EnviaShard)
                     })
                 })
                 .collect();
@@ -154,7 +142,7 @@ impl<'ctx> LayerSplitForward<'ctx> {
                 let r = t
                     .join()
                     .map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?;
-                out.push(r?.0);
+                out.push(r?);
             }
             Ok::<_, MatmulError>(out)
         })?;

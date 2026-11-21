@@ -24,7 +24,6 @@
 //! `LLAMA_RS_PSTATE`: `standard` (padrão), `peak`, ou `auto` para não mexer.
 
 use std::fs::File;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -39,9 +38,6 @@ const QUENTE: i64 = 102;
 const FRIO: i64 = 95;
 const PERIODO: Duration = Duration::from_millis(250);
 
-// uapi/drm/amdgpu_drm.h: DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_CTX, union drm_amdgpu_ctx),
-// com a union de 16 bytes.
-const DRM_IOCTL_AMDGPU_CTX: libc::c_ulong = 0xC010_6442;
 const AMDGPU_CTX_OP_ALLOC_CTX: u32 = 1;
 const AMDGPU_CTX_OP_SET_STABLE_PSTATE: u32 = 6;
 const PSTATE_NONE: u32 = 0;
@@ -55,20 +51,7 @@ const PSTATE_PEAK: u32 = 4;
 struct CtxArgs([u32; 4]);
 
 fn ctx_ioctl(fd: &File, args: &mut CtxArgs) -> std::io::Result<()> {
-    // SAFETY: `fd` é um render node amdgpu aberto; `args` tem o tamanho e o layout da union
-    // `drm_amdgpu_ctx` que o número da ioctl declara, e vive durante a chamada.
-    let r = unsafe {
-        libc::ioctl(
-            fd.as_raw_fd(),
-            DRM_IOCTL_AMDGPU_CTX as _,
-            std::ptr::from_mut(args),
-        )
-    };
-    if r == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    crate::ffi::amdgpu_ctx_ioctl(fd, &mut args.0)
 }
 
 fn modo_do_ambiente() -> Option<u32> {

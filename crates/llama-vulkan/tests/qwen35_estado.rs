@@ -5,10 +5,8 @@
 
 const MODELO: &str = "../../models/Qwen3.8-27B-Q5_K_M.gguf";
 
-#[allow(unsafe_code)]
-fn mapear() -> Option<memmap2::Mmap> {
-    let file = std::fs::File::open(MODELO).ok()?;
-    unsafe { memmap2::Mmap::map(&file) }.ok()
+fn mapear() -> Option<llama_sys::Mmap> {
+    llama_sys::mapear(std::path::Path::new(MODELO)).ok()
 }
 
 #[test]

@@ -8,6 +8,7 @@ pub enum PipelineError {
 }
 
 /// Push constants para o shader Q8_0 matvec.
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub(crate) struct PushConstants {
     pub n_in: u32,
@@ -30,7 +31,7 @@ pub struct ComputePipeline {
 
 impl ComputePipeline {
     /// Pipeline do matvec Q8_0 (5 bindings STORAGE_BUFFER + push de `PushConstants`).
-    pub fn new(dev: &ash::Device) -> Result<Self, PipelineError> {
+    pub fn new(dev: &crate::ffi::Device) -> Result<Self, PipelineError> {
         Self::with(
             dev,
             crate::Q8_0_MATVEC_SPV,
@@ -47,7 +48,7 @@ impl ComputePipeline {
     /// um push-constant range de `push_size` bytes (COMPUTE). `spv` é o SPIR-V já compilado.
     /// `spec_consts` são pares (constant_id, valor u32) para specialization constants.
     pub fn with(
-        dev: &ash::Device,
+        dev: &crate::ffi::Device,
         spv: &[u8],
         n_bindings: u32,
         push_size: u32,
@@ -67,8 +68,8 @@ impl ComputePipeline {
             p_bindings: bindings.as_ptr(),
             ..Default::default()
         };
-        // SAFETY: dev válido; dsl_info aponta para `bindings` vivo na stack.
-        let desc_set_layout = unsafe { dev.create_descriptor_set_layout(&dsl_info, None)? };
+        // dev válido; dsl_info aponta para `bindings` vivo na stack.
+        let desc_set_layout = dev.create_descriptor_set_layout(&dsl_info, None)?;
 
         let push_range = vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::COMPUTE,
@@ -87,8 +88,8 @@ impl ComputePipeline {
             },
             ..Default::default()
         };
-        // SAFETY: dev válido; layout_info aponta para dados vivos na stack.
-        let layout = unsafe { dev.create_pipeline_layout(&layout_info, None)? };
+        // dev válido; layout_info aponta para dados vivos na stack.
+        let layout = dev.create_pipeline_layout(&layout_info, None)?;
 
         assert_eq!(spv.len() % 4, 0, "SPIR-V size deve ser multiplo de 4 bytes");
         let spv_u32: Vec<u32> = spv
@@ -100,8 +101,8 @@ impl ComputePipeline {
             p_code: spv_u32.as_ptr(),
             ..Default::default()
         };
-        // SAFETY: dev válido; shader_info aponta para `spv_u32` vivo na stack.
-        let shader_module = unsafe { dev.create_shader_module(&shader_info, None)? };
+        // dev válido; shader_info aponta para `spv_u32` vivo na stack.
+        let shader_module = dev.create_shader_module(&shader_info, None)?;
 
         // Specialization constants (cada uma é um u32, layout little-endian contíguo).
         let spec_entries: Vec<vk::SpecializationMapEntry> = spec_consts
@@ -117,7 +118,7 @@ impl ComputePipeline {
             .iter()
             .flat_map(|&(_, v)| v.to_le_bytes())
             .collect();
-        // SAFETY: spec_entries e spec_data vivem neste stack frame; spec_info é consumido
+        // spec_entries e spec_data vivem neste stack frame; spec_info é consumido
         // por create_compute_pipelines antes que qualquer um deles seja dropped.
         let spec_info = vk::SpecializationInfo {
             map_entry_count: spec_entries.len() as u32,
@@ -144,14 +145,13 @@ impl ComputePipeline {
             layout,
             ..Default::default()
         };
-        // SAFETY: dev válido; pipeline_info aponta para dados vivos na stack.
-        let pipelines = unsafe {
-            dev.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-                .map_err(|(_, e)| e)?
-        };
+        // dev válido; pipeline_info aponta para dados vivos na stack.
+        let pipelines = dev
+            .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+            .map_err(|(_, e)| e)?;
         let pipeline = pipelines[0];
-        // SAFETY: shader_module foi criado por nós; a pipeline já o consumiu.
-        unsafe { dev.destroy_shader_module(shader_module, None) };
+        // shader_module foi criado por nós; a pipeline já o consumiu.
+        dev.destroy_shader_module(shader_module, None);
 
         Ok(Self {
             pipeline,
@@ -161,12 +161,10 @@ impl ComputePipeline {
     }
 
     /// Libera os recursos Vulkan. Deve ser chamado antes de dropar.
-    pub fn destroy(self, dev: &ash::Device) {
-        unsafe {
-            // SAFETY: pipeline, layout e desc_set_layout foram criados por nós nesta ordem inversa.
-            dev.destroy_pipeline(self.pipeline, None);
-            dev.destroy_pipeline_layout(self.layout, None);
-            dev.destroy_descriptor_set_layout(self.desc_set_layout, None);
-        }
+    pub fn destroy(self, dev: &crate::ffi::Device) {
+        // pipeline, layout e desc_set_layout foram criados por nós nesta ordem inversa.
+        dev.destroy_pipeline(self.pipeline, None);
+        dev.destroy_pipeline_layout(self.layout, None);
+        dev.destroy_descriptor_set_layout(self.desc_set_layout, None);
     }
 }

@@ -81,14 +81,11 @@ fn subir(
     let size = bytes.len() as vk::DeviceSize;
     let staging = create_buf(d, size, vk::BufferUsageFlags::TRANSFER_SRC).unwrap();
     let staging_mem = alloc_and_bind(ctx, phys, d, staging, true).unwrap();
-    // SAFETY: staging_mem é host-visible com `size`; ptr válido até unmap.
-    unsafe {
-        let ptr = d
-            .map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())
-            .unwrap();
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
-        d.unmap_memory(staging_mem);
-    }
+    // staging_mem é host-visible com `size`.
+    d.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())
+        .unwrap()
+        .escrever(bytes);
+    d.unmap_memory(staging_mem);
     let buf = create_buf(
         d,
         size,
@@ -99,11 +96,9 @@ fn subir(
     .unwrap();
     let mem = alloc_and_bind(ctx, phys, d, buf, false).unwrap();
     one_shot_copy(d, dev.queue, dev.cmd_pool, staging, buf, size).unwrap();
-    // SAFETY: cópia concluída (one_shot_copy espera a fila); handles criados aqui.
-    unsafe {
-        d.destroy_buffer(staging, None);
-        d.free_memory(staging_mem, None);
-    }
+    // cópia concluída (one_shot_copy espera a fila); handles criados aqui.
+    d.destroy_buffer(staging, None);
+    d.free_memory(staging_mem, None);
     (buf, mem)
 }
 
@@ -133,9 +128,8 @@ pub(crate) fn medir(
 ) -> (f64, Vec<f32>) {
     let d = &dev.device;
     let (xq, xd) = crate::tensor::quantize_x_host(x);
-    // SAFETY: Vec<u32>/Vec<f32> são POD contíguos; reinterpretar como bytes é válido.
-    let xq_b = unsafe { std::slice::from_raw_parts(xq.as_ptr().cast::<u8>(), xq.len() * 4) };
-    let xd_b = unsafe { std::slice::from_raw_parts(xd.as_ptr().cast::<u8>(), xd.len() * 4) };
+    let xq_b: &[u8] = bytemuck::cast_slice(&xq);
+    let xd_b: &[u8] = bytemuck::cast_slice(&xd);
     let bufs = [
         subir(ctx, phys, dev, w),
         subir(ctx, phys, dev, xq_b),
@@ -172,161 +166,155 @@ pub(crate) fn medir(
         query_count: 2,
         ..Default::default()
     };
-    // SAFETY: instance e handle válidos (enumerados por VulkanContext).
-    let periodo_ns = unsafe {
-        ctx.instance
-            .get_physical_device_properties(phys.handle)
-            .limits
-            .timestamp_period
-    };
-    // SAFETY: todos os handles abaixo são criados, usados e destruídos nesta frame, com a
+    // instance e handle válidos (enumerados por VulkanContext).
+    let periodo_ns = ctx
+        .instance
+        .get_physical_device_properties(phys.handle)
+        .limits
+        .timestamp_period;
+    // todos os handles abaixo são criados, usados e destruídos nesta frame, com a
     // fila esperada (`queue_wait_idle`) antes de qualquer destruição.
-    unsafe {
-        let desc_pool = d.create_descriptor_pool(&pool_info, None).unwrap();
-        let set = d
-            .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo {
-                descriptor_pool: desc_pool,
-                descriptor_set_count: 1,
-                p_set_layouts: &pipe.desc_set_layout,
+    let desc_pool = d.create_descriptor_pool(&pool_info, None).unwrap();
+    let set = d
+        .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo {
+            descriptor_pool: desc_pool,
+            descriptor_set_count: 1,
+            p_set_layouts: &pipe.desc_set_layout,
+            ..Default::default()
+        })
+        .unwrap()[0];
+    // Binding 4 (bias) recebe `xd` só para completar o layout; `tem_bias: 0` o ignora.
+    let infos: Vec<vk::DescriptorBufferInfo> = [0usize, 1, 2, 3, 2]
+        .iter()
+        .zip(tamanhos)
+        .map(|(&b, t)| vk::DescriptorBufferInfo {
+            buffer: bufs[b].0,
+            offset: 0,
+            range: t as vk::DeviceSize,
+        })
+        .collect();
+    let writes: Vec<vk::WriteDescriptorSet> = infos
+        .iter()
+        .enumerate()
+        .map(|(b, i)| vk::WriteDescriptorSet {
+            dst_set: set,
+            dst_binding: b as u32,
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            p_buffer_info: i,
+            ..Default::default()
+        })
+        .collect();
+    d.update_descriptor_sets(&writes, &[]);
+    let qp = d.create_query_pool(&qp_info, None).unwrap();
+
+    let grupos = push.n_out.div_ceil(k.rows_por_wg);
+    // O GEMM fatia o bloco em tiles de 32 colunas, um por grupo em Y.
+    let grupos_y = if k.rows_por_wg == crate::resident_forward::GEMM_LINHAS_POR_WG {
+        u32::try_from(cols.div_ceil(32)).unwrap_or(1)
+    } else {
+        1
+    };
+    let mut us = 0.0;
+    // Primeira submissão aquece (clocks, caches de pipeline); a segunda é a medida.
+    for _ in 0..2 {
+        let cmd = d
+            .allocate_command_buffers(&vk::CommandBufferAllocateInfo {
+                command_pool: dev.cmd_pool,
+                level: vk::CommandBufferLevel::PRIMARY,
+                command_buffer_count: 1,
                 ..Default::default()
             })
             .unwrap()[0];
-        // Binding 4 (bias) recebe `xd` só para completar o layout; `tem_bias: 0` o ignora.
-        let infos: Vec<vk::DescriptorBufferInfo> = [0usize, 1, 2, 3, 2]
-            .iter()
-            .zip(tamanhos)
-            .map(|(&b, t)| vk::DescriptorBufferInfo {
-                buffer: bufs[b].0,
-                offset: 0,
-                range: t as vk::DeviceSize,
-            })
-            .collect();
-        let writes: Vec<vk::WriteDescriptorSet> = infos
-            .iter()
-            .enumerate()
-            .map(|(b, i)| vk::WriteDescriptorSet {
-                dst_set: set,
-                dst_binding: b as u32,
-                descriptor_count: 1,
-                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-                p_buffer_info: i,
+        d.begin_command_buffer(
+            cmd,
+            &vk::CommandBufferBeginInfo {
+                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
                 ..Default::default()
-            })
-            .collect();
-        d.update_descriptor_sets(&writes, &[]);
-        let qp = d.create_query_pool(&qp_info, None).unwrap();
-
-        let grupos = push.n_out.div_ceil(k.rows_por_wg);
-        // O GEMM fatia o bloco em tiles de 32 colunas, um por grupo em Y.
-        let grupos_y = if k.rows_por_wg == crate::resident_forward::GEMM_LINHAS_POR_WG {
-            u32::try_from(cols.div_ceil(32)).unwrap_or(1)
-        } else {
-            1
+            },
+        )
+        .unwrap();
+        d.cmd_reset_query_pool(cmd, qp, 0, 2);
+        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe.pipeline);
+        d.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            pipe.layout,
+            0,
+            &[set],
+            &[],
+        );
+        d.cmd_push_constants(
+            cmd,
+            pipe.layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            bytemuck::bytes_of(&push),
+        );
+        d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, qp, 0);
+        let barreira = vk::MemoryBarrier {
+            src_access_mask: vk::AccessFlags::SHADER_WRITE,
+            dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            ..Default::default()
         };
-        let mut us = 0.0;
-        // Primeira submissão aquece (clocks, caches de pipeline); a segunda é a medida.
-        for _ in 0..2 {
-            let cmd = d
-                .allocate_command_buffers(&vk::CommandBufferAllocateInfo {
-                    command_pool: dev.cmd_pool,
-                    level: vk::CommandBufferLevel::PRIMARY,
-                    command_buffer_count: 1,
-                    ..Default::default()
-                })
-                .unwrap()[0];
-            d.begin_command_buffer(
+        for _ in 0..REPS {
+            d.cmd_dispatch(cmd, grupos, grupos_y, 1);
+            d.cmd_pipeline_barrier(
                 cmd,
-                &vk::CommandBufferBeginInfo {
-                    flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            d.cmd_reset_query_pool(cmd, qp, 0, 2);
-            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe.pipeline);
-            d.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                pipe.layout,
-                0,
-                &[set],
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[barreira],
+                &[],
                 &[],
             );
-            d.cmd_push_constants(
-                cmd,
-                pipe.layout,
-                vk::ShaderStageFlags::COMPUTE,
-                0,
-                std::slice::from_raw_parts(
-                    std::ptr::from_ref(&push).cast::<u8>(),
-                    size_of::<PushConstants>(),
-                ),
-            );
-            d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, qp, 0);
-            let barreira = vk::MemoryBarrier {
-                src_access_mask: vk::AccessFlags::SHADER_WRITE,
-                dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+        }
+        d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, 1);
+        d.end_command_buffer(cmd).unwrap();
+        d.queue_submit(
+            dev.queue,
+            &[vk::SubmitInfo {
+                command_buffer_count: 1,
+                p_command_buffers: &cmd,
                 ..Default::default()
-            };
-            for _ in 0..REPS {
-                d.cmd_dispatch(cmd, grupos, grupos_y, 1);
-                d.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[barreira],
-                    &[],
-                    &[],
-                );
-            }
-            d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, 1);
-            d.end_command_buffer(cmd).unwrap();
-            d.queue_submit(
-                dev.queue,
-                &[vk::SubmitInfo {
-                    command_buffer_count: 1,
-                    p_command_buffers: &cmd,
-                    ..Default::default()
-                }],
-                vk::Fence::null(),
-            )
-            .unwrap();
-            d.queue_wait_idle(dev.queue).unwrap();
-            d.free_command_buffers(dev.cmd_pool, &[cmd]);
-            let mut ts = [0u64; 2];
-            d.get_query_pool_results(
-                qp,
-                0,
-                &mut ts,
-                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
-            )
-            .unwrap();
-            us = (ts[1] - ts[0]) as f64 * f64::from(periodo_ns) / 1e3 / f64::from(REPS);
-        }
-
-        // Readback de y, para comparar variantes do shader entre si.
-        let y_bytes = (cols * n_out * 4) as u64;
-        let read = create_buf(d, y_bytes, vk::BufferUsageFlags::TRANSFER_DST).unwrap();
-        let read_mem = alloc_and_bind(ctx, phys, d, read, true).unwrap();
-        one_shot_copy(d, dev.queue, dev.cmd_pool, bufs[3].0, read, y_bytes).unwrap();
-        let ptr = d
-            .map_memory(read_mem, 0, y_bytes, vk::MemoryMapFlags::empty())
-            .unwrap();
-        let y = std::slice::from_raw_parts(ptr.cast::<f32>(), cols * n_out).to_vec();
-        d.unmap_memory(read_mem);
-        d.destroy_buffer(read, None);
-        d.free_memory(read_mem, None);
-
-        d.destroy_query_pool(qp, None);
-        d.destroy_descriptor_pool(desc_pool, None);
-        pipe.destroy(d);
-        for (b, m) in bufs {
-            d.destroy_buffer(b, None);
-            d.free_memory(m, None);
-        }
-        (us, y)
+            }],
+            vk::Fence::null(),
+        )
+        .unwrap();
+        d.queue_wait_idle(dev.queue).unwrap();
+        d.free_command_buffers(dev.cmd_pool, &[cmd]);
+        let mut ts = [0u64; 2];
+        d.get_query_pool_results(
+            qp,
+            0,
+            &mut ts,
+            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+        )
+        .unwrap();
+        us = (ts[1] - ts[0]) as f64 * f64::from(periodo_ns) / 1e3 / f64::from(REPS);
     }
+
+    // Readback de y, para comparar variantes do shader entre si.
+    let y_bytes = (cols * n_out * 4) as u64;
+    let read = create_buf(d, y_bytes, vk::BufferUsageFlags::TRANSFER_DST).unwrap();
+    let read_mem = alloc_and_bind(ctx, phys, d, read, true).unwrap();
+    one_shot_copy(d, dev.queue, dev.cmd_pool, bufs[3].0, read, y_bytes).unwrap();
+    let y = d
+        .map_memory(read_mem, 0, y_bytes, vk::MemoryMapFlags::empty())
+        .unwrap()
+        .ler::<f32>(cols * n_out);
+    d.unmap_memory(read_mem);
+    d.destroy_buffer(read, None);
+    d.free_memory(read_mem, None);
+
+    d.destroy_query_pool(qp, None);
+    d.destroy_descriptor_pool(desc_pool, None);
+    pipe.destroy(d);
+    for (b, m) in bufs {
+        d.destroy_buffer(b, None);
+        d.free_memory(m, None);
+    }
+    (us, y)
 }
 
 fn linha(nome: &str, n_in: usize, n_out: usize, bytes: usize, us: f64) {
