@@ -118,14 +118,14 @@ fn batch_do_modelo(raw: &GpuRawWeights) -> usize {
     }
 }
 
-/// Teto de tiles do GEMM dos experts (`moe_contar.comp`): no máximo um tile parcial por
+/// Teto de tiles dos experts agrupados (`moe_contar.comp`): no máximo um tile parcial por
 /// expert além dos cheios. O shader recebe o mesmo número pelo push.
 pub(crate) fn max_tiles_moe(n_expert: usize, n_slots: usize) -> usize {
     n_expert + n_slots.div_ceil(MOE_BN)
 }
 
-/// Colunas (slots) por tile do GEMM dos experts — o `BN` do `mul_mm.comp` com `COLS = 32`.
-pub(crate) const MOE_BN: usize = 32;
+/// Colunas (slots) por tile dos experts agrupados — o `MAXC` do `moe_agrupado.comp`.
+pub(crate) const MOE_BN: usize = 16;
 
 /// Linhas que um workgroup do `moe_matvec.comp` cobre: 4 waves × 2 linhas, vezes as
 /// linhas que cada wave pega por passada quando a linha tem menos de 8 superblocos.
@@ -704,9 +704,9 @@ pub(crate) enum PipeId {
     MoeTopk,
     MoeCombine,
     MoeContar,
-    /// GEMM dos experts no prefill (`mul_mm.comp` com `MOE = 1`).
-    MulMmMoeQ3K,
-    MulMmMoeIq3,
+    /// Experts agrupados por expert no prefill (`moe_agrupado.comp`).
+    MoeAgrupadoQ3K,
+    MoeAgrupadoIq3,
 }
 
 impl PipeId {
@@ -755,8 +755,8 @@ impl PipeId {
             PipeId::MoeTopk => "moe_topk",
             PipeId::MoeCombine => "moe_combine",
             PipeId::MoeContar => "moe_contar",
-            PipeId::MulMmMoeQ3K => "mul_mm_moe_q3k",
-            PipeId::MulMmMoeIq3 => "mul_mm_moe_iq3",
+            PipeId::MoeAgrupadoQ3K => "moe_agrupado_q3k",
+            PipeId::MoeAgrupadoIq3 => "moe_agrupado_iq3",
         }
     }
 
@@ -795,8 +795,8 @@ impl PipeId {
             | PipeId::MoeQ3K
             | PipeId::MoeIq3
             // weight, xq, xd, mapa → out
-            | PipeId::MulMmMoeQ3K
-            | PipeId::MulMmMoeIq3 => (&[0, 1, 2, 4], &[3]),
+            | PipeId::MoeAgrupadoQ3K
+            | PipeId::MoeAgrupadoIq3 => (&[0, 1, 2, 4], &[3]),
             PipeId::MoeContar => (&[0], &[1]),
             PipeId::MoeRouter => (&[0, 1], &[2]),
             PipeId::MoeTopk => (&[0], &[1, 2]),
@@ -1253,8 +1253,8 @@ pub struct ResidentForward<'ctx> {
     pub(crate) moe_topk: ComputePipeline,
     pub(crate) moe_combine: ComputePipeline,
     pub(crate) moe_contar: ComputePipeline,
-    pub(crate) mul_mm_moe_q3k: ComputePipeline,
-    pub(crate) mul_mm_moe_iq3: ComputePipeline,
+    pub(crate) moe_agrupado_q3k: ComputePipeline,
+    pub(crate) moe_agrupado_iq3: ComputePipeline,
     pub(crate) desc_pool: vk::DescriptorPool,
     pub(crate) state: Option<ResidentState<'ctx>>,
     /// Clock fixo enquanto houver geração (ver `pstate.rs`). Só no backend carregado.
@@ -1606,11 +1606,10 @@ impl<'ctx> ResidentForward<'ctx> {
         let moe_combine = ComputePipeline::with(d, crate::MOE_COMBINE_SPV, 3, 8, &[])?;
         // (ids, mapa) + n_slots, n_expert, bn, max_tiles.
         let moe_contar = ComputePipeline::with(d, crate::MOE_CONTAR_SPV, 2, 16, &[])?;
-        let bn = MOE_BN as u32;
-        let mul_mm_moe_q3k =
-            ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, bn), (1, 3), (2, 1)])?;
-        let mul_mm_moe_iq3 =
-            ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, bn), (1, 5), (2, 1)])?;
+        let moe_agrupado_q3k =
+            ComputePipeline::with(d, crate::MOE_AGRUPADO_SPV, 5, push_mv, &[(0, 0)])?;
+        let moe_agrupado_iq3 =
+            ComputePipeline::with(d, crate::MOE_AGRUPADO_SPV, 5, push_mv, &[(0, 1)])?;
 
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -1677,8 +1676,8 @@ impl<'ctx> ResidentForward<'ctx> {
             moe_topk,
             moe_combine,
             moe_contar,
-            mul_mm_moe_q3k,
-            mul_mm_moe_iq3,
+            moe_agrupado_q3k,
+            moe_agrupado_iq3,
             desc_pool,
             state: None,
             pstate: None,
@@ -4050,8 +4049,8 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::MoeTopk => &self.moe_topk,
             PipeId::MoeCombine => &self.moe_combine,
             PipeId::MoeContar => &self.moe_contar,
-            PipeId::MulMmMoeQ3K => &self.mul_mm_moe_q3k,
-            PipeId::MulMmMoeIq3 => &self.mul_mm_moe_iq3,
+            PipeId::MoeAgrupadoQ3K => &self.moe_agrupado_q3k,
+            PipeId::MoeAgrupadoIq3 => &self.moe_agrupado_iq3,
         }
     }
 
@@ -4910,7 +4909,7 @@ impl<'ctx> ResidentForward<'ctx> {
             nt,
             u32s(&[mc.n_expert, mc.n_usados]),
         )?);
-        // No bloco de prefill os slots são agrupados por expert e os experts vão pelo GEMM:
+        // No bloco de prefill os slots são agrupados por expert (`moe_agrupado.comp`):
         // cada peso sai da memória uma vez para todos os tokens que o escolheram. No decode
         // (um token, 8 slots) o matvec por slot já lê cada peso uma vez.
         let agrupar = n_tok > 1;
@@ -4926,21 +4925,21 @@ impl<'ctx> ResidentForward<'ctx> {
                 u32s(&[slots, mc.n_expert, MOE_BN, max_tiles]),
             )?);
         }
-        let moe_gemm = |w: &QWeight,
-                        ativ: (&Buf, &Buf),
-                        dst: &Buf,
-                        n_in: usize,
-                        n_out: usize,
-                        x_por_slot: bool|
+        let moe_agrupado = |w: &QWeight,
+                            ativ: (&Buf, &Buf),
+                            dst: &Buf,
+                            n_in: usize,
+                            n_out: usize,
+                            x_por_slot: bool|
          -> Result<PlannedOp, MatmulError> {
             if !agrupar {
                 return moe_mv(w, ativ, dst, n_in, n_out, x_por_slot);
             }
             let pipe = match w.ty {
-                gguf::GgmlType::Q3_K => PipeId::MulMmMoeQ3K,
-                gguf::GgmlType::IQ3_XXS => PipeId::MulMmMoeIq3,
+                gguf::GgmlType::Q3_K => PipeId::MoeAgrupadoQ3K,
+                gguf::GgmlType::IQ3_XXS => PipeId::MoeAgrupadoIq3,
                 outro => {
-                    eprintln!("[plano] experts {outro:?} não têm GEMM na GPU");
+                    eprintln!("[plano] experts {outro:?} não têm kernel agrupado na GPU");
                     return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
                 }
             };
@@ -4953,12 +4952,12 @@ impl<'ctx> ResidentForward<'ctx> {
                     (dst.buffer, 0, ((n_out * slots) * 4) as vk::DeviceSize),
                     (mb.mapa.buffer, 0, mb.mapa.size),
                 ],
-                u32::try_from(n_out.div_ceil(GEMM_LINHAS_POR_WG as usize)).unwrap_or(u32::MAX),
+                u32::try_from(n_out.div_ceil(256)).unwrap_or(u32::MAX),
                 u32s(&[n_in, n_out, mc.n_usados, usize::from(x_por_slot)]),
             )?;
             Ok(Self::com_y(op, u32::try_from(max_tiles).unwrap_or(1)))
         };
-        plan.push(moe_gemm(
+        plan.push(moe_agrupado(
             &mq.gate_exps,
             (&st.b_xq, &st.b_xd),
             &mb.g,
@@ -4966,7 +4965,7 @@ impl<'ctx> ResidentForward<'ctx> {
             mc.n_ff_exp,
             false,
         )?);
-        plan.push(moe_gemm(
+        plan.push(moe_agrupado(
             &mq.up_exps,
             (&st.b_xq, &st.b_xd),
             &mb.u,
@@ -4986,7 +4985,7 @@ impl<'ctx> ResidentForward<'ctx> {
             u32::try_from((ff_slots * n_tok / 32).div_ceil(64)).unwrap_or(u32::MAX),
             u32s(&[ff_slots * n_tok]),
         )?);
-        plan.push(moe_gemm(
+        plan.push(moe_agrupado(
             &mq.down_exps,
             (&mb.xq, &mb.xd),
             &mb.y,

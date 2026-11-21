@@ -68,4 +68,5 @@ pub(crate) const MOE_ROUTER_SPV: &[u8] = include_bytes!(concat!(env!("MOE_ROUTER
 pub(crate) const MOE_TOPK_SPV: &[u8] = include_bytes!(concat!(env!("MOE_TOPK_SPV")));
 pub(crate) const MOE_COMBINE_SPV: &[u8] = include_bytes!(concat!(env!("MOE_COMBINE_SPV")));
 pub(crate) const MOE_CONTAR_SPV: &[u8] = include_bytes!(concat!(env!("MOE_CONTAR_SPV")));
+pub(crate) const MOE_AGRUPADO_SPV: &[u8] = include_bytes!(concat!(env!("MOE_AGRUPADO_SPV")));
 pub(crate) const ATENCAO_BLOCO_SPV: &[u8] = include_bytes!(concat!(env!("ATENCAO_BLOCO_SPV")));

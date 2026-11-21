@@ -2,8 +2,8 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 
-// Agrupa os slots (token, k) do bloco de prefill por expert, para o GEMM dos experts
-// (`mul_mm.comp` com `MOE = 1`) ler o peso de cada expert uma vez para todos os tokens que o
+// Agrupa os slots (token, k) do bloco de prefill por expert, para o matvec agrupado
+// (`moe_agrupado.comp`) ler o peso de cada expert uma vez para todos os tokens que o
 // escolheram — o `count_experts.comp` do llama.cpp, num workgroup só.
 //
 // Saída em `mapa` (uints):

@@ -222,9 +222,9 @@ fn mapa_de(ids: &[u32], n_expert: usize, bn: usize) -> (Vec<u32>, usize) {
     (m, max_tiles)
 }
 
-/// O GEMM dos experts no prefill (`mul_mm.comp`, `MOE = 1`): 40 tokens, 4 de 8 experts por
-/// token, com experts que recebem mais de 32 slots (dois tiles) e outros nenhum.
-fn moe_gemm_caso(ty: GgmlType, x_por_slot: bool) {
+/// Os experts agrupados do prefill (`moe_agrupado.comp`): 40 tokens, 4 de 8 experts por
+/// token, com experts que recebem mais de 16 slots (vários tiles) e outros nenhum.
+fn moe_agrupado_caso(ty: GgmlType, x_por_slot: bool) {
     com_gpu(|ctx, phys, dev| {
         let (n_expert, n_usados, n_tok) = (8usize, 4usize, 40usize);
         let (n_in, n_out) = if x_por_slot { (512, 192) } else { (2048, 136) };
@@ -235,8 +235,8 @@ fn moe_gemm_caso(ty: GgmlType, x_por_slot: bool) {
             .collect();
         let n_cols = if x_por_slot { ids.len() } else { n_tok };
         let x = ativ(n_in * n_cols, 11);
-        let (mapa, max_tiles) = mapa_de(&ids, n_expert, 32);
-        let gpu = llama_vulkan::matmul::dispatch_moe_gemm(
+        let (mapa, max_tiles) = mapa_de(&ids, n_expert, 16);
+        let gpu = llama_vulkan::matmul::dispatch_moe_agrupado(
             ctx,
             phys,
             dev,
@@ -260,24 +260,24 @@ fn moe_gemm_caso(ty: GgmlType, x_por_slot: bool) {
             let err = erro_rel(&gpu[s * n_out..(s + 1) * n_out], &cpu);
             assert!(
                 err < 1e-5,
-                "{ty:?} GEMM MoE slot {s} (expert {e}) divergiu: {err}"
+                "{ty:?} agrupado slot {s} (expert {e}) divergiu: {err}"
             );
         }
         eprintln!(
-            "{ty:?} GEMM MoE x_por_slot={x_por_slot}: {} slots ok",
+            "{ty:?} agrupado x_por_slot={x_por_slot}: {} slots ok",
             ids.len()
         );
     });
 }
 
 #[test]
-fn moe_gemm_q3_k_bate_com_a_cpu() {
-    moe_gemm_caso(GgmlType::Q3_K, false);
-    moe_gemm_caso(GgmlType::Q3_K, true);
+fn moe_agrupado_q3_k_bate_com_a_cpu() {
+    moe_agrupado_caso(GgmlType::Q3_K, false);
+    moe_agrupado_caso(GgmlType::Q3_K, true);
 }
 
 #[test]
-fn moe_gemm_iq3_xxs_bate_com_a_cpu() {
-    moe_gemm_caso(GgmlType::IQ3_XXS, false);
-    moe_gemm_caso(GgmlType::IQ3_XXS, true);
+fn moe_agrupado_iq3_xxs_bate_com_a_cpu() {
+    moe_agrupado_caso(GgmlType::IQ3_XXS, false);
+    moe_agrupado_caso(GgmlType::IQ3_XXS, true);
 }

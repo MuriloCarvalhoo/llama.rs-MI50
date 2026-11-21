@@ -695,10 +695,10 @@ pub fn dispatch_mul_mm_q8_0(
     )
 }
 
-/// GEMM dos experts (`mul_mm.comp` com `MOE = 1`) com um mapa de tiles pronto — o que o
+/// Experts agrupados (`moe_agrupado.comp`) com um mapa de tiles pronto — o que o
 /// `moe_contar.comp` monta na GPU. `w_bytes` é o tensor 3D como está no GGUF.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_moe_gemm(
+pub fn dispatch_moe_agrupado(
     ctx: &VulkanContext,
     phys: &VulkanPhysicalDevice,
     dev: &VulkanDevice,
@@ -714,12 +714,12 @@ pub fn dispatch_moe_gemm(
     x_por_slot: bool,
 ) -> Result<Vec<f32>, MatmulError> {
     let (tipo, bloco) = match ty {
-        gguf::GgmlType::Q3_K => (3, 110),
-        gguf::GgmlType::IQ3_XXS => (5, 98),
+        gguf::GgmlType::Q3_K => (0, 110),
+        gguf::GgmlType::IQ3_XXS => (1, 98),
         _ => return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT)),
     };
     let mut alinhado = vec![0u8; w_bytes.len() / bloco * 112];
-    if tipo == 3 {
+    if tipo == 0 {
         crate::tensor::pad_q3_k_into(w_bytes, &mut alinhado);
     } else {
         crate::tensor::repack_iq3_xxs_into(w_bytes, &mut alinhado);
@@ -729,14 +729,14 @@ pub fn dispatch_moe_gemm(
         ctx,
         phys,
         dev,
-        crate::MUL_MM_SPV,
+        crate::MOE_AGRUPADO_SPV,
         &alinhado,
         x_f32,
         n_in,
         n_out,
         x_f32.len() / n_in,
-        crate::resident_forward::GEMM_LINHAS_POR_WG,
-        &[(0, u(crate::resident_forward::MOE_BN)?), (1, tipo), (2, 1)],
+        256,
+        &[(0, tipo)],
         &Extra {
             ids: Some(mapa),
             push23: [u(n_usados)?, u32::from(x_por_slot)],

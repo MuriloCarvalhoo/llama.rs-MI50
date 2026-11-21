@@ -40,6 +40,7 @@ fn main() {
         ("moe_topk.comp", "MOE_TOPK_SPV"),
         ("moe_combine.comp", "MOE_COMBINE_SPV"),
         ("moe_contar.comp", "MOE_CONTAR_SPV"),
+        ("moe_agrupado.comp", "MOE_AGRUPADO_SPV"),
         // Atenção do bloco de prefill com o KV compartilhado pelo tile de Q.
         ("atencao_bloco.comp", "ATENCAO_BLOCO_SPV"),
     ];
