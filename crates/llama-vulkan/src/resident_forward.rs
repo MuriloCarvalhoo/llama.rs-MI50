@@ -504,6 +504,7 @@ pub(crate) struct Cfg {
     pub head_dim: usize,
     pub n_ff: usize,
     pub rope_dim: usize,
+    pub rope_neox: bool,
     pub kv_dim: usize,
     pub vocab: usize,
     pub ctx: usize,
@@ -1567,7 +1568,7 @@ impl<'ctx> ResidentForward<'ctx> {
         let norm_fused = ComputePipeline::with(d, crate::NORM_FUSED_SPV, 3, 8, &[])?;
         // dim:u32 + eps:f32 + n_parciais:u32
         let norm_p2 = ComputePipeline::with(d, crate::NORM_P2_SPV, 6, 12, &[])?;
-        let rope = ComputePipeline::with(d, crate::ROPE_SPV, 2, 20, &[])?;
+        let rope = ComputePipeline::with(d, crate::ROPE_SPV, 2, 24, &[])?;
         // (k, freq, kcache) + n_head, head_dim, rope_dim, pos, kv_off.
         let kv_pack = ComputePipeline::with(d, crate::KV_PACK_SPV, 4, 8, &[])?;
         let attention = ComputePipeline::with(d, crate::ATTENTION_SPV, 4, 28, &[])?;
@@ -1774,6 +1775,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 head_dim: config.head_dim,
                 n_ff: config.n_ff,
                 rope_dim: config.rope_dim,
+                rope_neox: config.rope_neox,
                 kv_dim,
                 vocab: config.vocab,
                 ctx: config.ctx,
@@ -3416,6 +3418,7 @@ impl<'ctx> ResidentForward<'ctx> {
             rope_dim: u32,
             pos: f32,
             stride: u32,
+            neox: u32,
         }
         let d = &self.dev.device;
         let xb = Buf::device(
@@ -3440,8 +3443,10 @@ impl<'ctx> ResidentForward<'ctx> {
             pos: pos as f32,
             // Cabeças contíguas neste helper de teste.
             stride: head_dim as u32,
+            // O helper compara com a RoPE NORM da CPU.
+            neox: 0,
         };
-        let pb = &bytemuck::bytes_of(&push)[..20];
+        let pb = bytemuck::bytes_of(&push);
         let pairs = n_head * (rope_dim / 2);
         self.dispatch_xy(
             &self.rope,
@@ -3569,6 +3574,7 @@ impl<'ctx> ResidentForward<'ctx> {
                     rope_dim: u32,
                     pos: f32,
                     stride: u32,
+                    neox: u32,
                 }
                 let pp = P {
                     n_head: *n_head,
@@ -3576,8 +3582,9 @@ impl<'ctx> ResidentForward<'ctx> {
                     rope_dim: c.rope_dim as u32,
                     pos: pos as f32,
                     stride: *stride,
+                    neox: u32::from(c.rope_neox),
                 };
-                bytemuck::bytes_of(&pp)[..20].to_vec()
+                bytemuck::bytes_of(&pp).to_vec()
             }
             PushSpec::KvPack { slot, n_tok } => {
                 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -5843,6 +5850,11 @@ impl<'ctx> ResidentForward<'ctx> {
             "ffn" => &st.b_ffn,
             "x" => &st.b_x,
             "xd" => &st.b_xd,
+            // Atenção completa: Q (com o gate ao lado), K e V do último token e a saída.
+            "q" => &st.b_q,
+            "k" => &st.b_k,
+            "v" => &st.b_v,
+            "attn" => &st.b_attn,
             _ => return None,
         };
         self.readback(buf, (buf.size / 4) as usize).ok()

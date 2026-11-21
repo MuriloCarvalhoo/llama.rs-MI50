@@ -7,6 +7,8 @@ layout(push_constant) uniform PC {
     // Distancia entre cabecas. Igual a head_dim quando sao contiguas; no Q do qwen35 e
     // 2*head_dim, porque cada cabeca traz query e gate lado a lado.
     uint stride;
+    // 1 = NEOX: pares (i, i + rope_dim/2), como o llama.cpp no Qwen2 e no Qwen3.5/3.8.
+    uint neox;
 } pc;
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -25,8 +27,10 @@ void main() {
     float theta = pos_t * fb.f[i];
     float s = sin(theta);
     float c = cos(theta);
-    float a = xb.x[base + 2u * i];
-    float b = xb.x[base + 2u * i + 1u];
-    xb.x[base + 2u * i]      = a * c - b * s;
-    xb.x[base + 2u * i + 1u] = a * s + b * c;
+    uint ia = pc.neox != 0u ? base + i : base + 2u * i;
+    uint ib = pc.neox != 0u ? base + i + half_rope : base + 2u * i + 1u;
+    float a = xb.x[ia];
+    float b = xb.x[ib];
+    xb.x[ia] = a * c - b * s;
+    xb.x[ib] = a * s + b * c;
 }

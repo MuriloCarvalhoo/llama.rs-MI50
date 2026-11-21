@@ -67,6 +67,10 @@ pub struct LlamaConfig {
     pub head_dim: usize,
     pub n_ff: usize,
     pub rope_dim: usize,
+    /// RoPE NEOX: gira os pares `(i, i + rope_dim/2)`. O llama.cpp usa esse modo no Qwen2 e
+    /// no Qwen3.5/3.8 (o `IMROPE` com as seções iguais no texto); o LLaMA gira pares
+    /// adjacentes porque o conversor já permuta as linhas de Q e K.
+    pub rope_neox: bool,
     pub rms_eps: f32,
     pub freq_base: f32,
     pub vocab: usize,
@@ -199,6 +203,7 @@ impl LlamaConfig {
             head_dim,
             n_ff,
             rope_dim,
+            rope_neox: matches!(arch.as_str(), "qwen2" | "qwen35" | "qwen35moe"),
             rms_eps: f
                 .get(&p("attention.layer_norm_rms_epsilon"))?
                 .as_f32("rms")?,

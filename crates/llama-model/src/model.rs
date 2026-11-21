@@ -202,6 +202,7 @@ impl<'a> Model<'a> {
                 c.rope_dim,
                 &self.freq_table,
                 pos0,
+                c.rope_neox,
             );
             rope_norm(
                 &mut k,
@@ -211,6 +212,7 @@ impl<'a> Model<'a> {
                 c.rope_dim,
                 &self.freq_table,
                 pos0,
+                c.rope_neox,
             );
 
             cache.append(l, &k, &v)?;
@@ -387,6 +389,7 @@ mod tests {
             c.rope_dim,
             &m.freq_table,
             0,
+            c.rope_neox,
         );
         let q_sum: f32 = q.iter().sum();
         assert!((q_sum - 148.969_82).abs() < 1e-1, "q_sum={q_sum}");

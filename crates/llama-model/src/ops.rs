@@ -415,9 +415,10 @@ pub(crate) fn matmul_q8_0_actq_packed(
     out
 }
 
-/// Otimização 3 — RoPE NORM com tabela de frequências pré-computada.
+/// Otimização 3 — RoPE NORM (ou NEOX, com `neox`) com tabela de frequências pré-computada.
 /// `freq_table[i] = freq_base^(-2i/rope_dim)` para i em 0..rope_dim/2.
 /// Elimina `powf` no loop interno (era a operação mais cara da RoPE).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rope_norm(
     x: &mut [f32],
     n_tok: usize,
@@ -426,18 +427,25 @@ pub(crate) fn rope_norm(
     rope_dim: usize,
     freq_table: &[f32],
     pos0: usize,
+    neox: bool,
 ) {
+    let meia = rope_dim / 2;
     for t in 0..n_tok {
         let pos = (pos0 + t) as f32;
         for h in 0..n_head {
             let base = (t * n_head + h) * head_dim;
-            for i in 0..rope_dim / 2 {
-                let theta = pos * freq_table[i];
+            for (i, &freq) in freq_table.iter().enumerate().take(meia) {
+                let theta = pos * freq;
                 let (s, c) = theta.sin_cos();
-                let a = x[base + 2 * i];
-                let b = x[base + 2 * i + 1];
-                x[base + 2 * i] = a * c - b * s;
-                x[base + 2 * i + 1] = a * s + b * c;
+                let (ia, ib) = if neox {
+                    (base + i, base + i + meia)
+                } else {
+                    (base + 2 * i, base + 2 * i + 1)
+                };
+                let a = x[ia];
+                let b = x[ib];
+                x[ia] = a * c - b * s;
+                x[ib] = a * s + b * c;
             }
         }
     }
@@ -561,7 +569,7 @@ mod tests {
         let freq_table: Vec<f32> = (0..2)
             .map(|i| 10000.0f32.powf(-2.0 * i as f32 / 4.0))
             .collect();
-        rope_norm(&mut x, 1, 1, 4, 4, &freq_table, 0);
+        rope_norm(&mut x, 1, 1, 4, 4, &freq_table, 0, false);
         assert!(
             x.iter()
                 .zip([1.0, 2.0, 3.0, 4.0])
@@ -576,7 +584,7 @@ mod tests {
         let freq_table: Vec<f32> = (0..2)
             .map(|i| 10000.0f32.powf(-2.0 * i as f32 / 4.0))
             .collect();
-        rope_norm(&mut x, 1, 1, 4, 4, &freq_table, 1);
+        rope_norm(&mut x, 1, 1, 4, 4, &freq_table, 1, false);
         assert!((x[0] - 1.0f32.cos()).abs() < 1e-6);
         assert!((x[1] - 1.0f32.sin()).abs() < 1e-6);
     }

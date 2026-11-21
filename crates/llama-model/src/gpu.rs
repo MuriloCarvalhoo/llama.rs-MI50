@@ -1170,6 +1170,7 @@ impl Model<'_> {
                 c.rope_dim,
                 &self.freq_table,
                 pos0,
+                c.rope_neox,
             );
             rope_norm(
                 &mut k,
@@ -1179,6 +1180,7 @@ impl Model<'_> {
                 c.rope_dim,
                 &self.freq_table,
                 pos0,
+                c.rope_neox,
             );
 
             cache.append(l, &k, &v)?;
@@ -1486,6 +1488,7 @@ mod tests {
             head_dim: 8,
             n_ff: 8,
             rope_dim: 8,
+            rope_neox: false,
             rms_eps: 1e-6,
             freq_base: 10_000.0,
             vocab: FimDoContexto::VOCAB,
