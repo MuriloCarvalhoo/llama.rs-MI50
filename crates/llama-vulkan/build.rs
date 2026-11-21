@@ -40,6 +40,8 @@ fn main() {
         ("moe_topk.comp", "MOE_TOPK_SPV"),
         ("moe_combine.comp", "MOE_COMBINE_SPV"),
         ("moe_contar.comp", "MOE_CONTAR_SPV"),
+        // Atenção do bloco de prefill com o KV compartilhado pelo tile de Q.
+        ("atencao_bloco.comp", "ATENCAO_BLOCO_SPV"),
     ];
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());

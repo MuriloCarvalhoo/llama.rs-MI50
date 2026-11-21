@@ -1,0 +1,193 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+layout(local_size_x = 256) in;
+
+// Atenção do bloco de prefill com o KV compartilhado entre as linhas de query — o tile de
+// Q do flash attention do llama.cpp (`flash_attn_prefill.comp`), sem matrix cores.
+//
+// O `attention_split16.comp` faz um workgroup por (token, cabeça, fatia): cada uma das
+// `n_rep` cabeças de query de um grupo GQA, e cada token do bloco, relê as mesmas posições
+// do KV. No prefill do Qwen3.8-35B-A3B isso era 45% do bloco de 256 em 16k de contexto, a
+// ~0,6 TMAC/s — preso na L2, não na conta.
+//
+// Aqui um workgroup cobre **uma cabeça de KV, TT tokens e uma fatia do KV**: as 32 linhas
+// de query (TT tokens × n_rep cabeças) dividem cada bloco de BC posições de K e V, que é
+// carregado uma vez na LDS. Cada thread tem 2 linhas × 16 dimensões de Q em registrador; o
+// produto escalar de uma posição é reduzido nas 16 lanes da linha (4 shuffles), e o
+// softmax online é atualizado uma vez por bloco de BC posições, não por posição.
+//
+// Saída: o mesmo registro parcial [m, l, acc[head_dim]] por (t, h, fatia) do split16, sem
+// dividir por l — o `attn_reduce.comp` combina as fatias. A fatia aqui é uniforme sobre o
+// alcance do tile (e não por token): cada (t, h) continua com `n_split` parciais disjuntos,
+// que é o que a redução exige.
+//
+// Exige head_dim = 256 (16 lanes × 16 dimensões por linha) e n_rep par (as duas linhas de
+// uma thread são do mesmo token). O plano cai no split16 fora disso.
+
+layout(set = 0, binding = 0) readonly buffer QBuf { float q[]; } qb;
+layout(set = 0, binding = 1) readonly buffer KBuf { uvec4 k4[]; } kb;
+layout(set = 0, binding = 2) readonly buffer VBuf { uvec4 v4[]; } vb;
+layout(set = 0, binding = 3) writeonly buffer PBuf { float p[]; } pbuf;
+
+layout(push_constant) uniform PC {
+    uint n_head; uint n_head_kv; uint head_dim;
+    uint total_len; uint kv_dim; uint kv_layer_off;
+    uint q_stride;
+} pc;
+
+const uint HD = 256u;
+const uint DPL = 16u;            // dimensões por lane
+const uint UV_POS = HD / 8u;     // uvec4 (8 f16) por posição: 32
+const uint BC = 16u;             // posições do KV por passo
+const uint LINHAS = 32u;         // linhas de query por workgroup (16 grupos × 2)
+
+shared uvec4 kl[BC * UV_POS];
+shared uvec4 vl[BC * UV_POS];
+
+float dot16(uvec4 a, uvec4 b, float qd[DPL]) {
+    float s = 0.0;
+    vec2 x;
+    x = unpackHalf2x16(a.x); s = fma(x.x, qd[0], s); s = fma(x.y, qd[1], s);
+    x = unpackHalf2x16(a.y); s = fma(x.x, qd[2], s); s = fma(x.y, qd[3], s);
+    x = unpackHalf2x16(a.z); s = fma(x.x, qd[4], s); s = fma(x.y, qd[5], s);
+    x = unpackHalf2x16(a.w); s = fma(x.x, qd[6], s); s = fma(x.y, qd[7], s);
+    x = unpackHalf2x16(b.x); s = fma(x.x, qd[8], s); s = fma(x.y, qd[9], s);
+    x = unpackHalf2x16(b.y); s = fma(x.x, qd[10], s); s = fma(x.y, qd[11], s);
+    x = unpackHalf2x16(b.z); s = fma(x.x, qd[12], s); s = fma(x.y, qd[13], s);
+    x = unpackHalf2x16(b.w); s = fma(x.x, qd[14], s); s = fma(x.y, qd[15], s);
+    return s;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint kv_h = gl_WorkGroupID.x;
+    uint tile = gl_WorkGroupID.y;
+    uint split = gl_WorkGroupID.z;
+    uint n_split = gl_NumWorkGroups.z;
+    uint n_rep = pc.n_head / pc.n_head_kv;
+    uint tt = LINHAS / n_rep;                 // tokens por workgroup
+    // O host só usa este kernel com o bloco múltiplo de `tt` (ver `atencao_bloco_serve`),
+    // então o grid dá o tamanho do bloco.
+    uint n_tok = gl_NumWorkGroups.y * tt;
+
+    uint lane = tid & 15u;
+    uint rg = tid >> 4u;
+    uint r0 = rg * 2u;
+    uint t_loc = r0 / n_rep;
+    uint hl = r0 % n_rep;                      // primeira das duas cabeças locais
+    uint t = tile * tt + t_loc;
+    bool ativa = r0 < tt * n_rep;
+    uint h0 = kv_h * n_rep + hl;
+
+    // Máscara causal, o mesmo contrato do split16: o bloco termina em total_len, e o
+    // token t vê as posições 0 .. total_len - (n_tok - 1) + t.
+    uint limite = ativa ? (pc.total_len - (n_tok - 1u) + t) : 0u;
+    uint ultimo = tile * tt + tt - 1u;
+    uint alcance = pc.total_len - (n_tok - 1u) + ultimo;   // limite do último token do tile
+
+    uint por_split = (alcance + n_split - 1u) / n_split;
+    uint ini = split * por_split;
+    uint fim = min(ini + por_split, alcance);
+
+    float scale = inversesqrt(float(HD));
+    float qd0[DPL];
+    float qd1[DPL];
+    uint qb0 = t * pc.n_head * pc.q_stride + h0 * pc.q_stride + lane * DPL;
+    for (uint i = 0u; i < DPL; i++) {
+        qd0[i] = ativa ? qb.q[qb0 + i] * scale : 0.0;
+        qd1[i] = ativa ? qb.q[qb0 + pc.q_stride + i] * scale : 0.0;
+    }
+
+    float acc0[DPL];
+    float acc1[DPL];
+    for (uint i = 0u; i < DPL; i++) { acc0[i] = 0.0; acc1[i] = 0.0; }
+    float m0 = -1.0e30;
+    float m1 = -1.0e30;
+    float l0 = 0.0;
+    float l1 = 0.0;
+
+    for (uint c0 = ini; c0 < fim; c0 += BC) {
+        barrier();
+        // Carga cooperativa de BC posições de K e V: 512 uvec4 de cada, 2 por thread.
+        for (uint u = tid; u < BC * UV_POS; u += 256u) {
+            uint pp = u / UV_POS;
+            uint j = c0 + pp;
+            uvec4 kk = uvec4(0u);
+            uvec4 vv = uvec4(0u);
+            if (j < fim) {
+                uint base4 = (pc.kv_layer_off + j * pc.kv_dim + kv_h * HD) >> 3u;
+                kk = kb.k4[base4 + (u % UV_POS)];
+                vv = vb.v4[base4 + (u % UV_POS)];
+            }
+            kl[u] = kk;
+            vl[u] = vv;
+        }
+        barrier();
+
+        float s0[BC];
+        float s1[BC];
+        float mx0 = -1.0e30;
+        float mx1 = -1.0e30;
+        for (uint pp = 0u; pp < BC; pp++) {
+            uvec4 a = kl[pp * UV_POS + lane * 2u];
+            uvec4 b = kl[pp * UV_POS + lane * 2u + 1u];
+            float x0 = dot16(a, b, qd0);
+            float x1 = dot16(a, b, qd1);
+            for (uint o = 1u; o < 16u; o <<= 1u) {
+                x0 += subgroupShuffleXor(x0, o);
+                x1 += subgroupShuffleXor(x1, o);
+            }
+            bool ok = c0 + pp < limite && c0 + pp < fim;
+            s0[pp] = ok ? x0 : -1.0e30;
+            s1[pp] = ok ? x1 : -1.0e30;
+            if (ok) {
+                mx0 = max(mx0, x0);
+                mx1 = max(mx1, x1);
+            }
+        }
+        float mn0 = max(m0, mx0);
+        float mn1 = max(m1, mx1);
+        float c0r = exp(m0 - mn0);
+        float c1r = exp(m1 - mn1);
+        l0 *= c0r;
+        l1 *= c1r;
+        for (uint i = 0u; i < DPL; i++) { acc0[i] *= c0r; acc1[i] *= c1r; }
+        for (uint pp = 0u; pp < BC; pp++) {
+            // Mascarada: peso zero explícito (exp(-1e30 - m) com m = -1e30 daria 1).
+            float e0 = s0[pp] > -1.0e29 ? exp(s0[pp] - mn0) : 0.0;
+            float e1 = s1[pp] > -1.0e29 ? exp(s1[pp] - mn1) : 0.0;
+            l0 += e0;
+            l1 += e1;
+            uvec4 a = vl[pp * UV_POS + lane * 2u];
+            uvec4 b = vl[pp * UV_POS + lane * 2u + 1u];
+            vec2 va[8];
+            va[0] = unpackHalf2x16(a.x); va[1] = unpackHalf2x16(a.y);
+            va[2] = unpackHalf2x16(a.z); va[3] = unpackHalf2x16(a.w);
+            va[4] = unpackHalf2x16(b.x); va[5] = unpackHalf2x16(b.y);
+            va[6] = unpackHalf2x16(b.z); va[7] = unpackHalf2x16(b.w);
+            for (uint i = 0u; i < 8u; i++) {
+                acc0[2u * i] = fma(e0, va[i].x, acc0[2u * i]);
+                acc0[2u * i + 1u] = fma(e0, va[i].y, acc0[2u * i + 1u]);
+                acc1[2u * i] = fma(e1, va[i].x, acc1[2u * i]);
+                acc1[2u * i + 1u] = fma(e1, va[i].y, acc1[2u * i + 1u]);
+            }
+        }
+        m0 = mn0;
+        m1 = mn1;
+    }
+
+    if (!ativa) { return; }
+    uint reg0 = ((t * pc.n_head + h0) * n_split + split) * (HD + 2u);
+    uint reg1 = ((t * pc.n_head + h0 + 1u) * n_split + split) * (HD + 2u);
+    if (lane == 0u) {
+        pbuf.p[reg0] = m0;
+        pbuf.p[reg0 + 1u] = l0;
+        pbuf.p[reg1] = m1;
+        pbuf.p[reg1 + 1u] = l1;
+    }
+    for (uint i = 0u; i < DPL; i++) {
+        pbuf.p[reg0 + 2u + lane * DPL + i] = acc0[i];
+        pbuf.p[reg1 + 2u + lane * DPL + i] = acc1[i];
+    }
+}

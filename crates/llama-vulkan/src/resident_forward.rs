@@ -680,6 +680,7 @@ pub(crate) enum PipeId {
     KvPack,
     Attention,
     AttentionSplit,
+    AtencaoBloco,
     AttnReduce,
     /// silu(gate) * up + quantização em int8 na mesma passada — `swiglu_quant.comp`.
     SwigluQuant,
@@ -735,6 +736,7 @@ impl PipeId {
             PipeId::KvPack => "kv_pack",
             PipeId::Attention => "attention",
             PipeId::AttentionSplit => "attention_split",
+            PipeId::AtencaoBloco => "atencao_bloco",
             PipeId::AttnReduce => "attn_reduce",
             PipeId::SwigluQuant => "swiglu_quant",
             PipeId::Add => "add",
@@ -800,7 +802,9 @@ impl PipeId {
             PipeId::MoeTopk => (&[0], &[1, 2]),
             // a saída do FFN é inout: entra o compartilhado, sai a soma.
             PipeId::MoeCombine => (&[0, 1, 2], &[0]),
-            PipeId::Attention | PipeId::AttentionSplit => (&[0, 1, 2], &[3]),
+            PipeId::Attention | PipeId::AttentionSplit | PipeId::AtencaoBloco => {
+                (&[0, 1, 2], &[3])
+            }
             PipeId::AttnReduce => (&[0], &[1]),
             PipeId::QuantizeX => (&[0], &[1, 2]),
             // a saída é inout: a segunda passada relê o que a primeira escreveu.
@@ -906,6 +910,10 @@ pub(crate) enum PlannedOp {
         curto: Box<PlannedOp>,
         split: Box<PlannedOp>,
         reduce: Box<PlannedOp>,
+        /// No bloco de prefill: a atenção com o KV compartilhado pelo tile de Q
+        /// (`atencao_bloco.comp`), no lugar do `split`. `None` no decode e quando a
+        /// geometria não serve (ver [`atencao_bloco_serve`]).
+        bloco: Option<Box<PlannedOp>>,
     },
 }
 
@@ -919,6 +927,34 @@ impl PlannedOp {
             PlannedOp::Atencao { .. } => "attention",
         }
     }
+}
+
+/// Linhas de query por workgroup do `atencao_bloco.comp` (16 grupos de 16 lanes × 2 linhas).
+const ATENCAO_BLOCO_LINHAS: usize = 32;
+
+/// Tokens do bloco que um workgroup do `atencao_bloco.comp` cobre, quando a geometria serve:
+/// head_dim 256, `n_rep` par e o bloco múltiplo desses tokens.
+pub(crate) fn atencao_bloco_serve(
+    head_dim: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    n_tok: usize,
+) -> Option<usize> {
+    let n_rep = n_head / n_head_kv.max(1);
+    if head_dim != 256 || n_rep == 0 || !n_rep.is_multiple_of(2) || n_rep > ATENCAO_BLOCO_LINHAS {
+        return None;
+    }
+    let tt = ATENCAO_BLOCO_LINHAS / n_rep;
+    (n_tok > 1 && n_tok.is_multiple_of(tt)).then_some(tt)
+}
+
+/// Fatias do KV para o `atencao_bloco.comp`: o bastante para ~240 workgroups (4 por CU nas
+/// 60 CUs), sem fatia menor que 64 posições.
+pub(crate) fn splits_do_bloco(total_len: u32, workgroups: u32) -> u32 {
+    let por_ocupacao = 240u32.div_ceil(workgroups.max(1));
+    por_ocupacao
+        .min((total_len / 64).max(1))
+        .clamp(1, MAX_SPLITS as u32)
 }
 
 /// Em quantas fatias dividir o KV. 1 mantém o caminho de um workgroup por cabeça.
@@ -1197,6 +1233,7 @@ pub struct ResidentForward<'ctx> {
     /// O mesmo contrato com um grupo de lanes por posição do KV — ver [`atencao16_serve`].
     pub(crate) attention_split16: ComputePipeline,
     pub(crate) attn_reduce: ComputePipeline,
+    pub(crate) atencao_bloco: ComputePipeline,
     pub(crate) swiglu_quant: ComputePipeline,
     pub(crate) add: ComputePipeline,
     // Camadas de atenção linear (qwen35).
@@ -1539,6 +1576,7 @@ impl<'ctx> ResidentForward<'ctx> {
         let attention_split = ComputePipeline::with(d, crate::ATTENTION_SPLIT_SPV, 4, 28, &[])?;
         let attention_split16 = ComputePipeline::with(d, crate::ATTENTION_SPLIT16_SPV, 4, 28, &[])?;
         let attn_reduce = ComputePipeline::with(d, crate::ATTN_REDUCE_SPV, 2, 12, &[])?;
+        let atencao_bloco = ComputePipeline::with(d, crate::ATENCAO_BLOCO_SPV, 4, 28, &[])?;
         // (gate, up, act inout, xq, xd) + n.
         let swiglu_quant = ComputePipeline::with(d, crate::SWIGLU_QUANT_SPV, 5, 4, &[])?;
         let add = ComputePipeline::with(d, crate::ADD_SPV, 2, 4, &[])?;
@@ -1621,6 +1659,7 @@ impl<'ctx> ResidentForward<'ctx> {
             attention_split,
             attention_split16,
             attn_reduce,
+            atencao_bloco,
             swiglu_quant,
             add,
             delta_net,
@@ -3376,10 +3415,14 @@ impl<'ctx> ResidentForward<'ctx> {
                     curto,
                     split,
                     reduce,
+                    bloco,
                 } => {
                     let mut le = Vec::new();
                     let mut esc = Vec::new();
-                    for parte in [curto.as_ref(), split.as_ref(), reduce.as_ref()] {
+                    for parte in [curto.as_ref(), split.as_ref(), reduce.as_ref()]
+                        .into_iter()
+                        .chain(bloco.as_deref())
+                    {
                         if let PlannedOp::Dispatch { le: l, esc: e, .. } = parte {
                             le.extend(l.iter().copied());
                             esc.extend(e.iter().copied());
@@ -3706,6 +3749,26 @@ impl<'ctx> ResidentForward<'ctx> {
                     curto,
                     split,
                     reduce,
+                    bloco: Some(bloco),
+                } => {
+                    // Bloco de prefill: o tile de Q divide o KV; sempre pela redução.
+                    let wgs = match bloco.as_ref() {
+                        PlannedOp::Dispatch {
+                            groups, groups_y, ..
+                        } => groups * groups_y,
+                        _ => 1,
+                    };
+                    let _ = (curto, split);
+                    let n_split = splits_do_bloco(total_len, wgs);
+                    self.gravar_dispatch(cmd, bloco, c, pos, total_len, n_split, n_split);
+                    self.full_barrier(cmd);
+                    self.gravar_dispatch(cmd, reduce, c, pos, total_len, 1, n_split);
+                }
+                PlannedOp::Atencao {
+                    curto,
+                    split,
+                    reduce,
+                    bloco: None,
                 } => {
                     // Contexto curto: um workgroup por cabeça, como sempre foi. Longo: o
                     // KV fatiado entre `n_split` workgroups e a redução dos parciais.
@@ -3819,6 +3882,7 @@ impl<'ctx> ResidentForward<'ctx> {
                     curto,
                     split,
                     reduce,
+                    ..
                 } => {
                     let n_split = splits_do_kv(total_len);
                     if n_split <= 1 {
@@ -3974,6 +4038,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 self.pipe_split(self.state.as_ref().map_or(0, |st| st.cfg.head_dim))
             }
             PipeId::AttnReduce => &self.attn_reduce,
+            PipeId::AtencaoBloco => &self.atencao_bloco,
             PipeId::SwigluQuant => &self.swiglu_quant,
             PipeId::Add => &self.add,
             PipeId::MatvecQ3K => &self.matvec_q3k,
@@ -4593,10 +4658,33 @@ impl<'ctx> ResidentForward<'ctx> {
                     )?,
                     nt,
                 );
+                let bloco = match atencao_bloco_serve(c.head_dim, c.n_head, c.n_head_kv, n_tok) {
+                    Some(tt) if modo == Modo::Batch => {
+                        let mut op = mk(
+                            PipeId::AtencaoBloco,
+                            &[
+                                (st.b_q.buffer, 0, nbt(q_out)),
+                                (st.kcache.buffer, 0, st.kcache.size),
+                                (st.vcache.buffer, 0, st.vcache.size),
+                                (st.b_attn_split.buffer, 0, st.b_attn_split.size),
+                            ],
+                            c.n_head_kv as u32,
+                            PushSpec::Attention {
+                                kv_layer_off: layer_off,
+                            },
+                        )?;
+                        if let PlannedOp::Dispatch { groups_y, .. } = &mut op {
+                            *groups_y = u32::try_from(n_tok / tt).unwrap_or(1);
+                        }
+                        Some(Box::new(op))
+                    }
+                    _ => None,
+                };
                 plan.push(PlannedOp::Atencao {
                     curto: Box::new(curto),
                     split: Box::new(split),
                     reduce: Box::new(reduce),
+                    bloco,
                 });
                 if !hib {
                     plan.push(mk(
@@ -5216,6 +5304,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 u(c.n_head),
                 PushSpec::AttnReduce,
             )?),
+            bloco: None,
         });
         if hib {
             let mut pg = Vec::with_capacity(8);
