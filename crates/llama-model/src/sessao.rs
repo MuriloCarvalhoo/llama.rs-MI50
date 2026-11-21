@@ -321,7 +321,7 @@ mod testes_de_sessao {
 
     struct BackendFalso {
         nb: usize,
-        /// `batch_resto` do backend: 0 = não há bloco menor.
+        /// Bloco menor do backend (`tamanhos_resto`): 0 = não há.
         resto: usize,
         /// Orçamento de `lote_cabe` (tokens × posições); `None` = sem limite.
         orcamento: Option<usize>,
@@ -367,8 +367,12 @@ mod testes_de_sessao {
         fn batch_size(&self) -> usize {
             self.nb
         }
-        fn batch_resto(&self) -> usize {
-            self.resto
+        fn tamanhos_resto(&self) -> Vec<usize> {
+            if self.resto > 0 {
+                vec![self.resto]
+            } else {
+                Vec::new()
+            }
         }
         fn lote_cabe(&self, pos0: usize, n_tok: usize) -> bool {
             self.orcamento

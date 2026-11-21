@@ -183,6 +183,11 @@ pub(crate) fn bloco_cabe(pos0: usize, n_tok: usize) -> bool {
 /// com o bloco de 256 até 255 tokens iriam pelo decode, a ~40 ms cada — 10 s num turno.
 const RESTO_TOK: usize = 32;
 
+/// Larguras dos planos do resto, em ordem decrescente. Múltiplos de 32 (ver a construção
+/// dos planos): com o bloco de 256, um prompt de 2047 tokens fazia 7 blocos de 32 depois
+/// dos cheios, a ~2,7 ms por token contra ~1,2 no bloco de 256.
+const TAMANHOS_RESTO: [usize; 3] = [128, 64, RESTO_TOK];
+
 /// Tokens do bloco de **verificação** do MTP: o token já amostrado, a proposta da cabeça
 /// e a proposta encadeada (a cabeça realimentada com o próprio hidden — o experimento da
 /// tarefa 6 mediu 41,7 % de aceitação condicionada no 2º, acima do limiar do plano).
@@ -1114,9 +1119,9 @@ pub(crate) struct ResidentState<'w> {
     /// `n_batch == 1`, e aí o prefill usa o plano de decode token a token.
     pub plan_batch: Vec<PlannedOp>,
     pub barreiras_batch: Vec<bool>,
-    /// O mesmo plano de prefill com `RESTO_TOK` tokens (vazio se o bloco não passa disso).
-    pub plan_resto: Vec<PlannedOp>,
-    pub barreiras_resto: Vec<bool>,
+    /// O mesmo plano de prefill com larguras menores que o bloco ([`TAMANHOS_RESTO`]), em
+    /// ordem decrescente: (tokens, plano, barreiras).
+    pub planos_resto: Vec<(usize, Vec<PlannedOp>, Vec<bool>)>,
     /// O mesmo par para o bloco de dois tokens do verify. Vazio sem MTP.
     pub plan_verify: Vec<PlannedOp>,
     pub barreiras_verify: Vec<bool>,
@@ -2174,8 +2179,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 barreiras: Vec::new(),
                 plan_batch: Vec::new(),
                 barreiras_batch: Vec::new(),
-                plan_resto: Vec::new(),
-                barreiras_resto: Vec::new(),
+                planos_resto: Vec::new(),
                 plan_verify: Vec::new(),
                 barreiras_verify: Vec::new(),
                 mtp: mtp_bufs,
@@ -2200,12 +2204,12 @@ impl<'ctx> ResidentForward<'ctx> {
             Vec::new()
         };
         // Os pipelines do GEMM servem a qualquer múltiplo de 32 colunas (o tile é de 32; só o
-        // grid muda), e o matvec-COLS foi criado com 32: o plano do resto não pede nada novo.
-        let plan_resto = if nbatch > RESTO_TOK {
-            me.build_plan_n(Modo::Batch, RESTO_TOK)?
-        } else {
-            Vec::new()
-        };
+        // grid muda), e o matvec-COLS foi criado com 32: os planos do resto não pedem nada
+        // novo. Por isso só múltiplos de 32.
+        let mut planos_resto = Vec::new();
+        for &n in TAMANHOS_RESTO.iter().filter(|&&n| n < nbatch) {
+            planos_resto.push((n, me.build_plan_n(Modo::Batch, n)?));
+        }
         // Plano da verificação do MTP: dois tokens, logits dos dois, snapshot do estado
         // recorrente entre eles.
         let plan_verify = if mtp {
@@ -2222,7 +2226,7 @@ impl<'ctx> ResidentForward<'ctx> {
             let maior = plan
                 .len()
                 .max(plan_batch.len())
-                .max(plan_resto.len())
+                .max(planos_resto.iter().map(|(_, p)| p.len()).max().unwrap_or(0))
                 .max(plan_verify.len());
             let info = vk::QueryPoolCreateInfo {
                 query_type: vk::QueryType::TIMESTAMP,
@@ -2260,8 +2264,13 @@ impl<'ctx> ResidentForward<'ctx> {
             st.barreiras = Self::marcar_barreiras(&plan, st);
             st.barreiras_batch = Self::marcar_barreiras(&plan_batch, st);
             st.plan_batch = plan_batch;
-            st.barreiras_resto = Self::marcar_barreiras(&plan_resto, st);
-            st.plan_resto = plan_resto;
+            st.planos_resto = planos_resto
+                .into_iter()
+                .map(|(n, p)| {
+                    let b = Self::marcar_barreiras(&p, st);
+                    (n, p, b)
+                })
+                .collect();
             st.barreiras_verify = Self::marcar_barreiras(&plan_verify, st);
             st.plan_verify = plan_verify;
             st.mtp_barreiras = Self::marcar_barreiras(&plan_mtp, st);
@@ -2276,8 +2285,8 @@ impl<'ctx> ResidentForward<'ctx> {
             }
             st.plan = plan;
             st.prof = prof;
-            let cortes = [&st.plan_batch, &st.plan_resto]
-                .iter()
+            let cortes = std::iter::once(&st.plan_batch)
+                .chain(st.planos_resto.iter().map(|(_, p, _)| p))
                 .map(|p| {
                     p.iter()
                         .filter(|op| matches!(op, PlannedOp::Atencao { .. }))
@@ -3657,7 +3666,12 @@ impl<'ctx> ResidentForward<'ctx> {
         let (plan, barreiras) = match modo {
             Modo::Decode => (&st.plan, &st.barreiras),
             Modo::Batch if n_tok == c.n_batch => (&st.plan_batch, &st.barreiras_batch),
-            Modo::Batch => (&st.plan_resto, &st.barreiras_resto),
+            Modo::Batch => st
+                .planos_resto
+                .iter()
+                .find(|(n, _, _)| *n == n_tok)
+                .map(|(_, p, b)| (p, b))
+                .ok_or(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT))?,
             Modo::Verify => (&st.plan_verify, &st.barreiras_verify),
         };
         // Os dois planos são medidos: cada um tem o seu acumulador, porque as listas de
@@ -5697,7 +5711,7 @@ impl<'ctx> ResidentForward<'ctx> {
             .as_ref()
             .ok_or(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?;
         let largura_ok =
-            n_tok == st.cfg.n_batch || (n_tok == RESTO_TOK && !st.plan_resto.is_empty());
+            n_tok == st.cfg.n_batch || st.planos_resto.iter().any(|(n, _, _)| *n == n_tok);
         if n_tok == 0 || (n_tok > 1 && !largura_ok) || pos0 + n_tok > st.cfg.ctx {
             return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
         }
@@ -6119,11 +6133,10 @@ impl llama_model::GpuResidentDecode for ResidentForward<'_> {
     fn batch_size(&self) -> usize {
         self.state.as_ref().map_or(1, |st| st.cfg.n_batch)
     }
-    fn batch_resto(&self) -> usize {
-        self.state
-            .as_ref()
-            .filter(|st| !st.plan_resto.is_empty())
-            .map_or(0, |_| RESTO_TOK)
+    fn tamanhos_resto(&self) -> Vec<usize> {
+        self.state.as_ref().map_or_else(Vec::new, |st| {
+            st.planos_resto.iter().map(|(n, _, _)| *n).collect()
+        })
     }
     fn lote_cabe(&self, pos0: usize, n_tok: usize) -> bool {
         bloco_cabe(pos0, n_tok)

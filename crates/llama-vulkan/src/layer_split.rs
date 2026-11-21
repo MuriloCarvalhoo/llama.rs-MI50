@@ -245,10 +245,10 @@ impl llama_model::GpuResidentDecode for LayerSplitForward<'_> {
             .first()
             .map_or(1, llama_model::GpuResidentDecode::batch_size)
     }
-    fn batch_resto(&self) -> usize {
+    fn tamanhos_resto(&self) -> Vec<usize> {
         self.shards
             .first()
-            .map_or(0, llama_model::GpuResidentDecode::batch_resto)
+            .map_or_else(Vec::new, llama_model::GpuResidentDecode::tamanhos_resto)
     }
     fn lote_cabe(&self, pos0: usize, n_tok: usize) -> bool {
         crate::resident_forward::bloco_cabe(pos0, n_tok)

@@ -434,21 +434,21 @@ pub trait GpuResidentDecode {
     fn batch_size(&self) -> usize {
         1
     }
-    /// Largura de um segundo bloco, menor, que `decode_batch` também aceita — para o resto
-    /// de um prompt depois dos blocos cheios não cair token a token. `0` = não há.
-    fn batch_resto(&self) -> usize {
-        0
+    /// Larguras menores, em ordem decrescente, que `decode_batch` também aceita — para o
+    /// resto de um prompt depois dos blocos cheios não cair token a token. Vazio = não há.
+    fn tamanhos_resto(&self) -> Vec<usize> {
+        Vec::new()
     }
     /// Se um bloco de `n_tok` tokens a partir de `pos0` cabe num passo só. O backend pode
     /// recusar blocos grandes em contexto fundo (o custo da atenção do bloco cresce com
-    /// tokens × posições); o prefill então segue com o bloco de `batch_resto`.
+    /// tokens × posições); o prefill então segue com os blocos de `tamanhos_resto`.
     fn lote_cabe(&self, _pos0: usize, _n_tok: usize) -> bool {
         true
     }
     /// Processa `tokens` nas posições `pos0..pos0 + tokens.len()` de uma vez, retornando
     /// os logits **do último** — os anteriores já ficaram no KV-cache, e é só isso que o
     /// prefill precisa. `tokens.len()` tem de ser exatamente `batch_size()` ou
-    /// `batch_resto()`.
+    /// um dos `tamanhos_resto()`.
     fn decode_batch(&self, tokens: &[u32], pos0: usize) -> Result<Vec<f32>, ModelError> {
         let mut logits = Vec::new();
         for (i, &t) in tokens.iter().enumerate() {
@@ -776,7 +776,7 @@ fn gerar_ids_residente(
 }
 
 /// Prefill de `ids[pos0..]`: blocos de `batch_size()` enquanto `lote_cabe`, depois de
-/// `batch_resto()`, e o que sobrar token a token. É o laço do `llama-cli` e da `Sessao`.
+/// `tamanhos_resto()`, e o que sobrar token a token. É o laço do `llama-cli` e da `Sessao`.
 ///
 /// Devolve os logits do último token, a posição seguinte e **o índice do token dentro do
 /// último bloco** que produziu esses logits. O terceiro só interessa ao MTP: é qual dos
@@ -791,7 +791,9 @@ pub(crate) fn prefill_residente(
     let mut logits = Vec::new();
     let mut pos = pos0;
     let mut hidden = 0usize;
-    for nb in [gpu.batch_size(), gpu.batch_resto()] {
+    let mut tamanhos = vec![gpu.batch_size()];
+    tamanhos.extend(gpu.tamanhos_resto());
+    for nb in tamanhos {
         while nb > 1 && ids.len() - pos >= nb && gpu.lote_cabe(pos, nb) {
             let Some(bloco) = ids.get(pos..pos + nb) else {
                 break;
