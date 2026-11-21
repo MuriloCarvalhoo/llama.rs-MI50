@@ -596,6 +596,7 @@ mod choose_sampler_tests {
             gpu_layer_split: false,
             mtp: false,
             trace: None,
+            file: None,
         }
     }
 

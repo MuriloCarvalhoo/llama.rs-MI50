@@ -5,5 +5,6 @@ pub mod api;
 pub mod detok;
 pub mod http;
 pub mod motor;
+pub mod roteador;
 pub mod saida;
 pub mod servidor;

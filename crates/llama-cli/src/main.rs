@@ -8,7 +8,16 @@ use llama_cli::args::Args;
 use llama_cli::run_generate;
 
 fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if let Some(arquivo) = &args.file {
+        match std::fs::read_to_string(arquivo) {
+            Ok(texto) => args.prompt = texto,
+            Err(e) => {
+                eprintln!("Erro: {}: {e}", arquivo.display());
+                std::process::exit(1);
+            }
+        }
+    }
 
     if !args.no_display_prompt {
         print!("{}", args.prompt);

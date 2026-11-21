@@ -15,6 +15,10 @@ pub struct Args {
     #[arg(short, long, default_value = "")]
     pub prompt: String,
 
+    /// Lê o prompt de um arquivo (como o `-f` do llama.cpp); substitui o `-p`.
+    #[arg(short = 'f', long = "file", conflicts_with = "prompt")]
+    pub file: Option<PathBuf>,
+
     /// Numero maximo de tokens a gerar
     #[arg(short = 'n', long, default_value_t = 128)]
     pub n_predict: usize,
@@ -38,7 +42,7 @@ pub struct Args {
     /// Tamanho maximo do contexto (KV-cache). Limitado ao do modelo.
     /// O KV-cache residente custa n_layer*ctx*kv_dim*2*4 bytes de VRAM — usar o
     /// context_length do GGUF (ex.: 131072 no Qwen2.5-14B) pediria dezenas de GB.
-    #[arg(long, default_value_t = 4096)]
+    #[arg(short = 'c', long, visible_alias = "ctx-size", default_value_t = 4096)]
     pub ctx: usize,
 
     /// Suprimir o prompt da saida

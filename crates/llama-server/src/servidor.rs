@@ -149,7 +149,7 @@ fn rota_rapida<W: Write>(
         ("POST", "/v1/chat/completions" | "/chat/completions") => return Ok(false),
         ("OPTIONS", _) => http::responder(escritor, 200, json, b"")?,
         ("GET", "/v1/models" | "/models") => {
-            let corpo = serde_json::to_vec(&api::lista_de_modelos(nome, agora()))?;
+            let corpo = serde_json::to_vec(&api::lista_de_modelos([nome], agora()))?;
             http::responder(escritor, 200, json, &corpo)?;
         }
         ("GET", "/health") => http::responder(escritor, 200, json, br#"{"status":"ok"}"#)?,
@@ -181,7 +181,7 @@ fn validar_chat(corpo: &[u8], nome: &str) -> Result<Pedido, (u16, Vec<u8>)> {
 }
 
 /// Ignora a query string: `/v1/models?x=1` é a mesma rota.
-fn caminho_base(caminho: &str) -> &str {
+pub(crate) fn caminho_base(caminho: &str) -> &str {
     caminho.split('?').next().unwrap_or(caminho)
 }
 

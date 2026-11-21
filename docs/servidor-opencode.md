@@ -53,6 +53,57 @@ escrita bloqueada → a geração é cancelada). Parâmetro inválido (`temperat
 O `context` do config tem de caber no `--ctx` do servidor: prompt maior que o contexto é
 recusado com erro, não truncado (truncar silenciosamente esconderia perda de instrução).
 
+## Modo roteador (vários modelos, como o do llama.cpp)
+
+Com `--models-preset`, o `llama-server` vira roteador: lê um INI no formato do
+`models.ini` do llama.cpp, lista todas as seções em `GET /v1/models` e encaminha cada
+pedido ao modelo do campo `model`. Cada modelo carregado é um `llama-server` filho (sob
+`numactl --interleave=all`) numa porta local; o stream SSE passa direto. Pedido para um
+modelo descarregado o carrega, e com `--models-max` (padrão 1) cheio o menos usado
+recentemente é morto antes — o processo sai e a VRAM volta antes de o próximo subir. Modelo
+com requisição em andamento não é descarregado: o pedido do outro modelo espera.
+
+```bash
+./target/release/llama-server --models-preset models.ini --host 127.0.0.1 --port 8081
+```
+
+```ini
+[*]
+gpu-layer-split = true
+
+[qwen3.8-27b]
+model           = /run/media/murilo/BACKUP/MODELOS/Qwen3.8-27B-Q4_K_M.gguf
+ctx-size        = 32768
+load-on-startup = true
+```
+
+Chaves aceitas: `model` (`m`), `ctx-size` (`c`), `n-gpu-layers` (`ngl`, sem efeito aqui),
+`gpu-layer-split`, `mtp` e `load-on-startup`. As outras (`flash-attn`, `mmproj`,
+`spec-type`...) geram um aviso e são ignoradas, então o `models.ini` do llama.cpp é lido
+sem edição. `--gpu-layer-split` e `--mtp` passados ao roteador valem para todos os filhos.
+Se o roteador morrer, os filhos saem sozinhos (percebem o stdin fechado), sem ficarem
+órfãos segurando VRAM.
+
+No opencode, o provider aponta para o roteador e lista os nomes das seções:
+
+```json
+"llamars-router": {
+  "npm": "@ai-sdk/openai-compatible",
+  "name": "llama-rs router (local)",
+  "options": { "baseURL": "http://127.0.0.1:8081/v1" },
+  "models": {
+    "qwen3.8-27b": {
+      "name": "Qwen3.8-27B (llama-rs)",
+      "tool_call": true, "reasoning": true,
+      "limit": { "context": 32768, "output": 8192 }
+    }
+  }
+}
+```
+
+As flags do llama.cpp também valem fora do roteador: `--host`/`--port` (no lugar de
+`--bind`), `-c`/`--ctx-size`, `--alias` (= `--nome`) e `-ngl` (aceito e ignorado).
+
 ## O formato deste modelo
 
 Duas coisas do Qwen3.8 que fogem do que se espera de um modelo OpenAI-like:

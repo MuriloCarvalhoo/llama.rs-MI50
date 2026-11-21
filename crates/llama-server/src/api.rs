@@ -285,11 +285,12 @@ pub fn chunk_final(
     })
 }
 
-pub fn lista_de_modelos(nome: &str, criado: u64) -> Value {
-    json!({
-        "object": "list",
-        "data": [{"id": nome, "object": "model", "created": criado, "owned_by": "llama-rs"}],
-    })
+pub fn lista_de_modelos<'a>(nomes: impl IntoIterator<Item = &'a str>, criado: u64) -> Value {
+    let data: Vec<Value> = nomes
+        .into_iter()
+        .map(|nome| json!({"id": nome, "object": "model", "created": criado, "owned_by": "llama-rs"}))
+        .collect();
+    json!({"object": "list", "data": data})
 }
 
 /// O `model` do pedido é o servido? Ausente vale (clientes locais costumam omitir), e a caixa
@@ -563,7 +564,7 @@ mod tests {
 
     #[test]
     fn lista_de_modelos_traz_o_modelo_carregado() {
-        let v = lista_de_modelos("qwen3.8-27b", 5);
+        let v = lista_de_modelos(["qwen3.8-27b"], 5);
 
         assert_eq!(v["object"], "list");
         assert_eq!(v["data"][0]["id"], "qwen3.8-27b");

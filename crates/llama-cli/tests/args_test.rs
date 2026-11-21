@@ -59,3 +59,30 @@ fn timings_flag_enabled() {
     let args = Args::try_parse_from(["llama-cli", "--model", "/tmp/m.gguf", "--timings"]).unwrap();
     assert!(args.timings);
 }
+
+#[test]
+fn aceita_os_nomes_do_llama_cpp() {
+    let args = Args::try_parse_from([
+        "llama-cli",
+        "-m",
+        "/tmp/m.gguf",
+        "-c",
+        "8192",
+        "--n-predict",
+        "16",
+        "-f",
+        "/tmp/prompt.txt",
+    ])
+    .unwrap();
+    assert_eq!(args.ctx, 8192);
+    assert_eq!(args.n_predict, 16);
+    assert_eq!(args.file.unwrap().to_str().unwrap(), "/tmp/prompt.txt");
+
+    let args =
+        Args::try_parse_from(["llama-cli", "-m", "/tmp/m.gguf", "--ctx-size", "2048"]).unwrap();
+    assert_eq!(args.ctx, 2048);
+    assert!(
+        Args::try_parse_from(["llama-cli", "-m", "/m", "-p", "a", "-f", "/b"]).is_err(),
+        "-p e -f juntos são ambíguos"
+    );
+}
