@@ -1,0 +1,32 @@
+#version 450
+
+// Saída do FFN de um MoE, por token:
+//
+//   f[t][i] = w[t][n_usados] * f[t][i] + Σ_k w[t][k] * y[t * n_usados + k][i]
+//
+// `f` entra com a saída do expert compartilhado (o `ffn_down` denso) e sai com a do FFN
+// inteiro; `w[t][n_usados]` é o sigmoid do gate do compartilhado (ver `moe_topk.comp`) e
+// `y` são as saídas do `down` de cada expert escolhido.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer FBuf { float f[]; } f_buf;
+layout(set = 0, binding = 1) readonly buffer YBuf { float y[]; } y_buf;
+layout(set = 0, binding = 2) readonly buffer WBuf { float w[]; } w_buf;
+
+layout(push_constant) uniform PC {
+    uint n_embd;
+    uint n_usados;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_embd) { return; }
+    uint t = gl_WorkGroupID.y;
+    uint wb = t * (pc.n_usados + 1u);
+    float acc = w_buf.w[wb + pc.n_usados] * f_buf.f[t * pc.n_embd + i];
+    for (uint k = 0u; k < pc.n_usados; k++) {
+        acc += w_buf.w[wb + k] * y_buf.y[(t * pc.n_usados + k) * pc.n_embd + i];
+    }
+    f_buf.f[t * pc.n_embd + i] = acc;
+}

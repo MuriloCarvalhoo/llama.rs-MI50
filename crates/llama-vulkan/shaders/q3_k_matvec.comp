@@ -1,0 +1,144 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_integer_dot_product : require
+
+// Matvec Q3_K: y[n_out] = W[n_out x n_in] * x[n_in], com W em superblocos Q3_K.
+//
+// Superbloco = 256 elementos em 110 bytes, alinhados em 112 no upload (7 uvec4):
+//   uvec4 0..1 : hmask[32] — o 3o bit de cada elemento
+//   uvec4 2..5 : qs[64]    — 2 bits por elemento, quatro elementos por byte
+//   uvec4 6    : .xyz = scales[12] (16 escalas de 6 bits), .w = d (f16) | pad
+//
+// O valor é `d * (s - 32) * q`, com q = (2 bits de qs) - (3o bit zerado ? 4 : 0). Mesma
+// ordem de `dequantize_row_q3_K`: o elemento n*128 + j4*32 + h*16 + l lê o byte
+// n*32 + h*16 + l de qs deslocado de 2*j4, e o bit 4*n + j4 de hmask[h*16 + l].
+//
+// Geometria igual à do Q4_K (`q4_k_matvec.comp`): a lane `j = lane & 7` cobre o sub-bloco
+// `j` de 32 elementos, que é exatamente um bloco da ativação int8. Dentro dele há duas
+// escalas (uma por metade de 16). O -4 sai do laço como no -32 do Q6_K:
+// soma((u - 4) * x) = soma(u * x) - 4 * soma(x), com u = q2 | (bit << 2) em 0..7.
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint WG_SIZE = 256u;
+layout(constant_id = 1) const uint ROWS_PER_WAVE = 2u;
+// Colunas (tokens) acumuladas contra o mesmo peso — ver `q4_k_matvec.comp`.
+layout(constant_id = 2) const uint COLS = 1u;
+const uint WAVES_PER_WG = WG_SIZE / 64u;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf { uvec4 w4[]; } weight_buf;
+layout(set = 0, binding = 1) readonly buffer XqBuf { ivec4 xq4[]; } xq_buf;
+layout(set = 0, binding = 2) readonly buffer XdBuf { float xd[]; } xd_buf;
+layout(set = 0, binding = 3) writeonly buffer OutBuf { float y[]; } out_buf;
+layout(set = 0, binding = 4) readonly buffer BiasBuf { float b[]; } bias_buf;
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint n_out;
+    uint row_offset; // vestigial
+    uint tem_bias;
+} pc;
+
+const uint UVEC4_PER_SB = 7u;   // 112 bytes
+
+uint byte_de(uvec4 v, uint i) {
+    uint w = i < 4u ? v.x : (i < 8u ? v.y : (i < 12u ? v.z : v.w));
+    return (w >> (8u * (i & 3u))) & 0xFFu;
+}
+
+// Escala `is` (0..15) já sem o offset de 32.
+int escala(uvec4 sc, uint is) {
+    uint lo = is < 8u ? (byte_de(sc, is) & 0xFu) : (byte_de(sc, is - 8u) >> 4u);
+    uint hi = (byte_de(sc, 8u + (is & 3u)) >> (2u * (is >> 2u))) & 3u;
+    return int(lo | (hi << 4u)) - 32;
+}
+
+// Os 4 valores u = q2 | (bit << 2) de uma palavra de qs e de hmask, empacotados em bytes.
+int upack(uint qw, uint hw, uint sh_q, uint sh_h) {
+    return int(((qw >> sh_q) & 0x03030303u) | (((hw >> sh_h) & 0x01010101u) << 2u));
+}
+
+int dot_meia(uvec4 q, uvec4 h, uint sh_q, uint sh_h, ivec4 x) {
+    int s = 0;
+    s = dotPacked4x8AccSatEXT(upack(q.x, h.x, sh_q, sh_h), x.x, s);
+    s = dotPacked4x8AccSatEXT(upack(q.y, h.y, sh_q, sh_h), x.y, s);
+    s = dotPacked4x8AccSatEXT(upack(q.z, h.z, sh_q, sh_h), x.z, s);
+    s = dotPacked4x8AccSatEXT(upack(q.w, h.w, sh_q, sh_h), x.w, s);
+    return s;
+}
+
+int soma4(ivec4 x) {
+    int s = 0;
+    s = dotPacked4x8AccSatEXT(0x01010101, x.x, s);
+    s = dotPacked4x8AccSatEXT(0x01010101, x.y, s);
+    s = dotPacked4x8AccSatEXT(0x01010101, x.z, s);
+    s = dotPacked4x8AccSatEXT(0x01010101, x.w, s);
+    return s;
+}
+
+void main() {
+    uint lane = gl_SubgroupInvocationID;
+    uint row = (gl_WorkGroupID.x * WAVES_PER_WG + gl_SubgroupID) * ROWS_PER_WAVE;
+    if (row >= pc.n_out) { return; }
+
+    uint n_sb = pc.n_in / 256u;
+    uint linha4 = n_sb * UVEC4_PER_SB;
+    uint n_blk = pc.n_in / 32u;
+
+    uint j = lane & 7u;
+    uint sb_in_grp = lane >> 3u;
+    uint n = j >> 2u;
+    uint sh_q = 2u * (j & 3u);
+    uint sh_h = 4u * n + (j & 3u);
+
+    float acc[ROWS_PER_WAVE * COLS];
+    for (uint i = 0u; i < ROWS_PER_WAVE * COLS; i++) { acc[i] = 0.0; }
+
+    for (uint sb0 = 0u; sb0 < n_sb; sb0 += 8u) {
+        uint sb = sb0 + sb_in_grp;
+        if (sb >= n_sb) { continue; }
+        uint blk = sb * 8u + j;
+
+        ivec4 xa[COLS];
+        ivec4 xb[COLS];
+        int sxa[COLS];
+        int sxb[COLS];
+        float xdv[COLS];
+        for (uint c = 0u; c < COLS; c++) {
+            uint cb = c * n_blk + blk;
+            xa[c] = xq_buf.xq4[cb * 2u];
+            xb[c] = xq_buf.xq4[cb * 2u + 1u];
+            sxa[c] = soma4(xa[c]);
+            sxb[c] = soma4(xb[c]);
+            xdv[c] = xd_buf.xd[cb];
+        }
+
+        for (uint r = 0u; r < ROWS_PER_WAVE; r++) {
+            if (row + r >= pc.n_out) { continue; }
+            uint b4 = (row + r) * linha4 + sb * UVEC4_PER_SB;
+            uvec4 h0 = weight_buf.w4[b4];
+            uvec4 h1 = weight_buf.w4[b4 + 1u];
+            uvec4 q0 = weight_buf.w4[b4 + 2u + 2u * n];
+            uvec4 q1 = weight_buf.w4[b4 + 3u + 2u * n];
+            uvec4 sc = weight_buf.w4[b4 + 6u];
+            float d = unpackHalf2x16(sc.w).x;
+            float s0 = d * float(escala(sc, 2u * j));
+            float s1 = d * float(escala(sc, 2u * j + 1u));
+            for (uint c = 0u; c < COLS; c++) {
+                int d0 = dot_meia(q0, h0, sh_q, sh_h, xa[c]) - 4 * sxa[c];
+                int d1 = dot_meia(q1, h1, sh_q, sh_h, xb[c]) - 4 * sxb[c];
+                acc[r * COLS + c] += xdv[c] * (s0 * float(d0) + s1 * float(d1));
+            }
+        }
+    }
+
+    for (uint r = 0u; r < ROWS_PER_WAVE; r++) {
+        for (uint c = 0u; c < COLS; c++) {
+            float s = subgroupAdd(acc[r * COLS + c]);
+            if (lane == 0u && row + r < pc.n_out) {
+                out_buf.y[c * pc.n_out + row + r] =
+                    pc.tem_bias != 0u ? s + bias_buf.b[row + r] : s;
+            }
+        }
+    }
+}

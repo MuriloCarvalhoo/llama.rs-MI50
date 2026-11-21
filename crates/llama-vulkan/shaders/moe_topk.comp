@@ -1,0 +1,74 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+// Seleção de experts de um token, num dispatch e sem volta ao host (uma wave por token):
+//
+//   p   = softmax(l[0 .. n_expert])
+//   ids = os n_usados maiores p (empate: menor índice)
+//   w_k = p[ids_k] / max(Σ p[ids], 6.1035e-5)          — `norm_w` do llama.cpp
+//   w[n_usados] = sigmoid(l[n_expert])                  — gate do expert compartilhado
+//
+// Mesma conta de `build_moe_ffn` com LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX e norm_w.
+
+layout(local_size_x = 64) in;
+// Teto de experts por lane (n_expert / 64): 8 cobre até 512 experts.
+const uint MAX_POR_LANE = 8u;
+
+layout(set = 0, binding = 0) readonly buffer LBuf { float l[]; } l_buf;
+layout(set = 0, binding = 1) writeonly buffer IdsBuf { uint ids[]; } ids_buf;
+layout(set = 0, binding = 2) writeonly buffer WBuf { float w[]; } w_buf;
+
+layout(push_constant) uniform PC {
+    uint n_expert;
+    uint n_usados;
+} pc;
+
+void main() {
+    uint lane = gl_SubgroupInvocationID;
+    uint t = gl_WorkGroupID.x;
+    uint n_linhas = pc.n_expert + 1u;
+
+    uint por_lane = pc.n_expert / 64u;
+    float p[MAX_POR_LANE];
+    float mx = -1.0 / 0.0;
+    for (uint i = 0u; i < por_lane; i++) {
+        p[i] = l_buf.l[t * n_linhas + lane + 64u * i];
+        mx = max(mx, p[i]);
+    }
+    mx = subgroupMax(mx);
+    float soma = 0.0;
+    for (uint i = 0u; i < por_lane; i++) {
+        p[i] = exp(p[i] - mx);
+        soma += p[i];
+    }
+    soma = subgroupAdd(soma);
+    for (uint i = 0u; i < por_lane; i++) { p[i] /= soma; }
+
+    float sel = 0.0;
+    float total = 0.0;
+    for (uint k = 0u; k < pc.n_usados; k++) {
+        // melhor da lane (o primeiro índice no empate: i cresce com o índice do expert)
+        float melhor = -1.0;
+        uint idx = 0xFFFFFFFFu;
+        for (uint i = 0u; i < por_lane; i++) {
+            if (p[i] > melhor) { melhor = p[i]; idx = lane + 64u * i; }
+        }
+        float vmax = subgroupMax(melhor);
+        uint escolhido = subgroupMin(melhor == vmax ? idx : 0xFFFFFFFFu);
+        if (lane == 0u) { ids_buf.ids[t * pc.n_usados + k] = escolhido; }
+        if (escolhido % 64u == lane) {
+            p[escolhido / 64u] = -1.0;
+        }
+        if (lane == k) { sel = vmax; }
+        total += vmax;
+    }
+    total = max(total, 6.103515625e-5);
+    if (lane < pc.n_usados) {
+        w_buf.w[t * (pc.n_usados + 1u) + lane] = sel / total;
+    }
+    if (lane == 0u) {
+        float g = l_buf.l[t * n_linhas + pc.n_expert];
+        w_buf.w[t * (pc.n_usados + 1u) + pc.n_usados] = 1.0 / (1.0 + exp(-g));
+    }
+}

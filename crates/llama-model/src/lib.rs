@@ -29,13 +29,13 @@ mod sessao;
 pub(crate) mod spin_pool;
 mod weights;
 
-pub use config::{DeltaNetConfig, LlamaConfig};
+pub use config::{DeltaNetConfig, LlamaConfig, MoeConfig};
 pub use error::ModelError;
 #[cfg(feature = "gpu")]
 pub use gpu::{
     AuxLayer, GpuAuxWeights, GpuLayerRaw, GpuMatmul, GpuRawWeights, GpuResidentDecode,
-    HIDDEN_CABECA, MTP_ATE, MixerRaw, MtpAux, MtpRaw, PassoMtp, QTensor, TokenEmbd, VERIFY_TOK,
-    gerar_streaming_residente, mtp_compensa,
+    HIDDEN_CABECA, MTP_ATE, MixerRaw, MoeRaw, MtpAux, MtpRaw, PassoMtp, QTensor, TokenEmbd,
+    VERIFY_TOK, gerar_streaming_residente, mtp_compensa,
 };
 pub use model::Model;
 #[cfg(feature = "gpu")]

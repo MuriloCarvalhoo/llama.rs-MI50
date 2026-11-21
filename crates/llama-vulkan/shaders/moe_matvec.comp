@@ -1,0 +1,222 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_integer_dot_product : require
+
+// Matvec dos experts de um MoE: cada slot (token, k) multiplica a ativação pela matriz do
+// expert que o top-k escolheu para ele.
+//
+//   y[s * n_out + linha] = W[ids[s]][linha, :] · x[col(s), :]
+//
+// `ids` vem do `moe_topk.comp` e é lido aqui, na GPU — o host nunca vê qual expert foi
+// escolhido. O grid Y é o slot (n_tok * n_usados); o X particiona as linhas, como no matvec
+// denso. `col(s)` é `s / n_usados` no gate/up (os 8 experts do token leem a mesma entrada) e
+// `s` no down (cada slot tem a sua, saída do SwiGLU do próprio expert).
+//
+// O peso é o tensor 3D inteiro, `[n_expert][n_out][n_in]`, com os blocos alinhados em 112
+// bytes (7 uvec4) nos dois tipos:
+//
+// - TIPO 0, Q3_K: o mesmo layout e a mesma conta do `q3_k_matvec.comp`.
+// - TIPO 1, IQ3_XXS: reempacotado no upload para
+//     uvec4 0..3 : qs[64] — índices na grade, 8 por sub-bloco de 32
+//     uvec4 4..5 : uma palavra por sub-bloco: escala nos 4 bits altos, 4 índices de sinal de 7
+//     uvec4 6    : .x = d (f16) | pad
+//   Cada índice de qs aponta 4 magnitudes de 8 bits (≤ 62) em `IQ3XXS_GRID`. O sinal
+//   entra sem desempacotar: dot(g ⊙ ±1, x) = dot(g, x) - 2 * dot(g & neg, x), com `neg` com
+//   0xFF nos bytes negativos. O 8º bit de sinal é a paridade dos 7 — o `ksigns_iq2xs` do
+//   llama.cpp, calculado. Mesma ordem de `dequantize_row_iq3_xxs`.
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint TIPO = 0u;
+const uint WAVES_PER_WG = 4u;
+const uint ROWS_PER_WAVE = 2u;
+const uint UVEC4_PER_SB = 7u;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf { uvec4 w4[]; } weight_buf;
+layout(set = 0, binding = 1) readonly buffer XqBuf { ivec4 xq4[]; } xq_buf;
+layout(set = 0, binding = 2) readonly buffer XdBuf { float xd[]; } xd_buf;
+layout(set = 0, binding = 3) writeonly buffer OutBuf { float y[]; } out_buf;
+layout(set = 0, binding = 4) readonly buffer IdsBuf { uint ids[]; } ids_buf;
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint n_out;
+    uint n_usados;
+    uint x_por_slot;   // 1 no down: cada slot tem a sua ativação
+} pc;
+
+// `iq3xxs_grid` de `ggml-common.h`.
+const uint IQ3XXS_GRID[256] = uint[256](
+    0x04040404u, 0x04040414u, 0x04040424u, 0x04040c0cu, 0x04040c1cu, 0x04040c3eu, 0x04041404u, 0x04041414u,
+    0x04041c0cu, 0x04042414u, 0x04043e1cu, 0x04043e2cu, 0x040c040cu, 0x040c041cu, 0x040c0c04u, 0x040c0c14u,
+    0x040c140cu, 0x040c142cu, 0x040c1c04u, 0x040c1c14u, 0x040c240cu, 0x040c2c24u, 0x040c3e04u, 0x04140404u,
+    0x04140414u, 0x04140424u, 0x04140c0cu, 0x04141404u, 0x04141414u, 0x04141c0cu, 0x04141c1cu, 0x04141c3eu,
+    0x04142c0cu, 0x04142c3eu, 0x04143e2cu, 0x041c040cu, 0x041c043eu, 0x041c0c04u, 0x041c0c14u, 0x041c142cu,
+    0x041c3e04u, 0x04240c1cu, 0x04241c3eu, 0x04242424u, 0x04242c3eu, 0x04243e1cu, 0x04243e2cu, 0x042c040cu,
+    0x042c043eu, 0x042c1c14u, 0x042c2c14u, 0x04341c2cu, 0x04343424u, 0x043e0c04u, 0x043e0c24u, 0x043e0c34u,
+    0x043e241cu, 0x043e340cu, 0x0c04040cu, 0x0c04041cu, 0x0c040c04u, 0x0c040c14u, 0x0c04140cu, 0x0c04141cu,
+    0x0c041c04u, 0x0c041c14u, 0x0c041c24u, 0x0c04243eu, 0x0c042c04u, 0x0c0c0404u, 0x0c0c0414u, 0x0c0c0c0cu,
+    0x0c0c1404u, 0x0c0c1414u, 0x0c14040cu, 0x0c14041cu, 0x0c140c04u, 0x0c140c14u, 0x0c14140cu, 0x0c141c04u,
+    0x0c143e14u, 0x0c1c0404u, 0x0c1c0414u, 0x0c1c1404u, 0x0c1c1c0cu, 0x0c1c2434u, 0x0c1c3434u, 0x0c24040cu,
+    0x0c24042cu, 0x0c242c04u, 0x0c2c1404u, 0x0c2c1424u, 0x0c2c2434u, 0x0c2c3e0cu, 0x0c34042cu, 0x0c3e1414u,
+    0x0c3e2404u, 0x14040404u, 0x14040414u, 0x14040c0cu, 0x14040c1cu, 0x14041404u, 0x14041414u, 0x14041434u,
+    0x14041c0cu, 0x14042414u, 0x140c040cu, 0x140c041cu, 0x140c042cu, 0x140c0c04u, 0x140c0c14u, 0x140c140cu,
+    0x140c1c04u, 0x140c341cu, 0x140c343eu, 0x140c3e04u, 0x14140404u, 0x14140414u, 0x14140c0cu, 0x14140c3eu,
+    0x14141404u, 0x14141414u, 0x14141c3eu, 0x14142404u, 0x14142c2cu, 0x141c040cu, 0x141c0c04u, 0x141c0c24u,
+    0x141c3e04u, 0x141c3e24u, 0x14241c2cu, 0x14242c1cu, 0x142c041cu, 0x142c143eu, 0x142c240cu, 0x142c3e24u,
+    0x143e040cu, 0x143e041cu, 0x143e0c34u, 0x143e242cu, 0x1c04040cu, 0x1c040c04u, 0x1c040c14u, 0x1c04140cu,
+    0x1c04141cu, 0x1c042c04u, 0x1c04342cu, 0x1c043e14u, 0x1c0c0404u, 0x1c0c0414u, 0x1c0c1404u, 0x1c0c1c0cu,
+    0x1c0c2424u, 0x1c0c2434u, 0x1c14040cu, 0x1c14041cu, 0x1c140c04u, 0x1c14142cu, 0x1c142c14u, 0x1c143e14u,
+    0x1c1c0c0cu, 0x1c1c1c1cu, 0x1c241c04u, 0x1c24243eu, 0x1c243e14u, 0x1c2c0404u, 0x1c2c0434u, 0x1c2c1414u,
+    0x1c2c2c2cu, 0x1c340c24u, 0x1c341c34u, 0x1c34341cu, 0x1c3e1c1cu, 0x1c3e3404u, 0x24040424u, 0x24040c3eu,
+    0x24041c2cu, 0x24041c3eu, 0x24042c1cu, 0x24042c3eu, 0x240c3e24u, 0x24141404u, 0x24141c3eu, 0x24142404u,
+    0x24143404u, 0x24143434u, 0x241c043eu, 0x241c242cu, 0x24240424u, 0x24242c0cu, 0x24243424u, 0x242c142cu,
+    0x242c241cu, 0x242c3e04u, 0x243e042cu, 0x243e0c04u, 0x243e0c14u, 0x243e1c04u, 0x2c040c14u, 0x2c04240cu,
+    0x2c043e04u, 0x2c0c0404u, 0x2c0c0434u, 0x2c0c1434u, 0x2c0c2c2cu, 0x2c140c24u, 0x2c141c14u, 0x2c143e14u,
+    0x2c1c0414u, 0x2c1c2c1cu, 0x2c240c04u, 0x2c24141cu, 0x2c24143eu, 0x2c243e14u, 0x2c2c0414u, 0x2c2c1c0cu,
+    0x2c342c04u, 0x2c3e1424u, 0x2c3e2414u, 0x34041424u, 0x34042424u, 0x34042434u, 0x34043424u, 0x340c140cu,
+    0x340c340cu, 0x34140c3eu, 0x34143424u, 0x341c1c04u, 0x341c1c34u, 0x34242424u, 0x342c042cu, 0x342c2c14u,
+    0x34341c1cu, 0x343e041cu, 0x343e140cu, 0x3e04041cu, 0x3e04042cu, 0x3e04043eu, 0x3e040c04u, 0x3e041c14u,
+    0x3e042c14u, 0x3e0c1434u, 0x3e0c2404u, 0x3e140c14u, 0x3e14242cu, 0x3e142c14u, 0x3e1c0404u, 0x3e1c0c2cu,
+    0x3e1c1c1cu, 0x3e1c3404u, 0x3e24140cu, 0x3e24240cu, 0x3e2c0404u, 0x3e2c0414u, 0x3e2c1424u, 0x3e341c04u
+);
+
+shared uint grade[256];
+
+uint byte_de(uvec4 v, uint i) {
+    uint w = i < 4u ? v.x : (i < 8u ? v.y : (i < 12u ? v.z : v.w));
+    return (w >> (8u * (i & 3u))) & 0xFFu;
+}
+
+uint palavra(uvec4 v, uint i) {
+    return i == 0u ? v.x : (i == 1u ? v.y : (i == 2u ? v.z : v.w));
+}
+
+int escala_q3(uvec4 sc, uint is) {
+    uint lo = is < 8u ? (byte_de(sc, is) & 0xFu) : (byte_de(sc, is - 8u) >> 4u);
+    uint hi = (byte_de(sc, 8u + (is & 3u)) >> (2u * (is >> 2u))) & 3u;
+    return int(lo | (hi << 4u)) - 32;
+}
+
+int upack(uint qw, uint hw, uint sh_q, uint sh_h) {
+    return int(((qw >> sh_q) & 0x03030303u) | (((hw >> sh_h) & 0x01010101u) << 2u));
+}
+
+int dot_meia(uvec4 q, uvec4 h, uint sh_q, uint sh_h, ivec4 x) {
+    int s = 0;
+    s = dotPacked4x8AccSatEXT(upack(q.x, h.x, sh_q, sh_h), x.x, s);
+    s = dotPacked4x8AccSatEXT(upack(q.y, h.y, sh_q, sh_h), x.y, s);
+    s = dotPacked4x8AccSatEXT(upack(q.z, h.z, sh_q, sh_h), x.z, s);
+    s = dotPacked4x8AccSatEXT(upack(q.w, h.w, sh_q, sh_h), x.w, s);
+    return s;
+}
+
+int soma4(ivec4 x) {
+    int s = 0;
+    s = dotPacked4x8AccSatEXT(0x01010101, x.x, s);
+    s = dotPacked4x8AccSatEXT(0x01010101, x.y, s);
+    s = dotPacked4x8AccSatEXT(0x01010101, x.z, s);
+    s = dotPacked4x8AccSatEXT(0x01010101, x.w, s);
+    return s;
+}
+
+// Bytes de `nib` (4 bits) espalhados: 0xFF onde o bit está ligado.
+uint mascara_neg(uint nib) {
+    return ((nib * 0x00204081u) & 0x01010101u) * 0xFFu;
+}
+
+// dot de 8 elementos de um índice de qs par/ímpar contra duas palavras da ativação.
+int dot_iq3(uint qi1, uint qi2, uint sinais, int xa, int xb) {
+    uint g1 = grade[qi1];
+    uint g2 = grade[qi2];
+    uint n1 = g1 & mascara_neg(sinais & 0xFu);
+    uint n2 = g2 & mascara_neg(sinais >> 4u);
+    int s = 0;
+    s = dotPacked4x8AccSatEXT(int(g1), xa, s);
+    s = dotPacked4x8AccSatEXT(int(g2), xb, s);
+    int neg = 0;
+    neg = dotPacked4x8AccSatEXT(int(n1), xa, neg);
+    neg = dotPacked4x8AccSatEXT(int(n2), xb, neg);
+    return s - 2 * neg;
+}
+
+void main() {
+    if (TIPO == 1u) {
+        grade[gl_LocalInvocationIndex] = IQ3XXS_GRID[gl_LocalInvocationIndex];
+        barrier();
+    }
+    uint lane = gl_SubgroupInvocationID;
+    uint row = (gl_WorkGroupID.x * WAVES_PER_WG + gl_SubgroupID) * ROWS_PER_WAVE;
+    if (row >= pc.n_out) { return; }
+
+    uint slot = gl_WorkGroupID.y;
+    uint expert = ids_buf.ids[slot];
+    uint col = pc.x_por_slot != 0u ? slot : slot / pc.n_usados;
+
+    uint n_sb = pc.n_in / 256u;
+    uint linha4 = n_sb * UVEC4_PER_SB;
+    uint n_blk = pc.n_in / 32u;
+    uint base_exp = expert * pc.n_out * linha4;
+
+    uint j = lane & 7u;
+    uint sb_in_grp = lane >> 3u;
+    uint n = j >> 2u;
+    uint sh_q = 2u * (j & 3u);
+    uint sh_h = 4u * n + (j & 3u);
+
+    float acc[ROWS_PER_WAVE];
+    for (uint r = 0u; r < ROWS_PER_WAVE; r++) { acc[r] = 0.0; }
+
+    for (uint sb0 = 0u; sb0 < n_sb; sb0 += 8u) {
+        uint sb = sb0 + sb_in_grp;
+        if (sb >= n_sb) { continue; }
+        uint cb = col * n_blk + sb * 8u + j;
+        ivec4 xa = xq_buf.xq4[cb * 2u];
+        ivec4 xb = xq_buf.xq4[cb * 2u + 1u];
+        float xdv = xd_buf.xd[cb];
+
+        for (uint r = 0u; r < ROWS_PER_WAVE; r++) {
+            if (row + r >= pc.n_out) { continue; }
+            uint b4 = base_exp + (row + r) * linha4 + sb * UVEC4_PER_SB;
+            if (TIPO == 0u) {
+                uvec4 h0 = weight_buf.w4[b4];
+                uvec4 h1 = weight_buf.w4[b4 + 1u];
+                uvec4 q0 = weight_buf.w4[b4 + 2u + 2u * n];
+                uvec4 q1 = weight_buf.w4[b4 + 3u + 2u * n];
+                uvec4 sc = weight_buf.w4[b4 + 6u];
+                float d = unpackHalf2x16(sc.w).x;
+                int d0 = dot_meia(q0, h0, sh_q, sh_h, xa) - 4 * soma4(xa);
+                int d1 = dot_meia(q1, h1, sh_q, sh_h, xb) - 4 * soma4(xb);
+                acc[r] += xdv * d * (float(escala_q3(sc, 2u * j)) * float(d0)
+                                   + float(escala_q3(sc, 2u * j + 1u)) * float(d1));
+            } else {
+                uvec4 qv = weight_buf.w4[b4 + (j >> 1u)];
+                uint qw0 = palavra(qv, (j & 1u) * 2u);
+                uint qw1 = palavra(qv, (j & 1u) * 2u + 1u);
+                uint aux = palavra(weight_buf.w4[b4 + 4u + (j >> 2u)], j & 3u);
+                float d = unpackHalf2x16(weight_buf.w4[b4 + 6u].x).x;
+                float db = d * (0.5 + float(aux >> 28u)) * 0.5;
+                int s = 0;
+                for (uint l = 0u; l < 4u; l++) {
+                    uint s7 = (aux >> (7u * l)) & 127u;
+                    uint sinais = s7 | ((bitCount(s7) & 1u) << 7u);
+                    uint qw = l < 2u ? qw0 : qw1;
+                    uint qi1 = (qw >> (16u * (l & 1u))) & 0xFFu;
+                    uint qi2 = (qw >> (16u * (l & 1u) + 8u)) & 0xFFu;
+                    // elementos 8l..8l+7 = palavras 2l e 2l+1 do bloco de 32 da ativação
+                    int x1 = l < 2u ? (l == 0u ? xa.x : xa.z) : (l == 2u ? xb.x : xb.z);
+                    int x2 = l < 2u ? (l == 0u ? xa.y : xa.w) : (l == 2u ? xb.y : xb.w);
+                    s += dot_iq3(qi1, qi2, sinais, x1, x2);
+                }
+                acc[r] += xdv * db * float(s);
+            }
+        }
+    }
+
+    for (uint r = 0u; r < ROWS_PER_WAVE; r++) {
+        float s = subgroupAdd(acc[r]);
+        if (lane == 0u && row + r < pc.n_out) {
+            out_buf.y[slot * pc.n_out + row + r] = s;
+        }
+    }
+}

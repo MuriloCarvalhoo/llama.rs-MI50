@@ -58,6 +58,26 @@ pub(crate) fn pad_q6_k_into(src: &[u8], dst: &mut [u8]) {
     });
 }
 
+/// Pad do Q3_K: superblocos de 110 B alinhados em 112 (7 uvec4) — `q3_k_matvec.comp` lê
+/// `hmask`, `qs` e o par `scales|d` em `uvec4`, e 110 não é múltiplo de 16.
+pub(crate) fn pad_q3_k_into(src: &[u8], dst: &mut [u8]) {
+    por_bloco(src, dst, 110, 112, |s, d| {
+        d[..110].copy_from_slice(s);
+        d[110..112].fill(0);
+    });
+}
+
+/// Repack do IQ3_XXS: `d(2) | qs(64) | sinais(32)` em 98 B vira
+/// `qs(64) | sinais(32) | d(2) | pad(14)` em 112 B, para `qs` e as palavras de sinal caírem
+/// alinhadas em `uvec4` — ver `moe_matvec.comp`.
+pub(crate) fn repack_iq3_xxs_into(src: &[u8], dst: &mut [u8]) {
+    por_bloco(src, dst, 98, 112, |s, d| {
+        d[..96].copy_from_slice(&s[2..98]);
+        d[96..98].copy_from_slice(&s[..2]);
+        d[98..112].fill(0);
+    });
+}
+
 #[derive(Debug, Error)]
 pub enum TensorError {
     #[error("Vulkan error: {0}")]
@@ -411,6 +431,8 @@ fn layout_de(ty: gguf::GgmlType) -> Option<(usize, usize)> {
         gguf::GgmlType::Q6_K => Some((210, 212)),
         gguf::GgmlType::Q5_K => Some((176, 176)),
         gguf::GgmlType::Q4_K => Some((144, 144)),
+        gguf::GgmlType::Q3_K => Some((110, 112)),
+        gguf::GgmlType::IQ3_XXS => Some((98, 112)),
         _ => None,
     }
 }
@@ -420,6 +442,8 @@ fn transformar(ty: gguf::GgmlType, src: &[u8], dst: &mut [u8]) {
     match ty {
         gguf::GgmlType::Q8_0 => repack_q8_0_into(src, dst),
         gguf::GgmlType::Q6_K => pad_q6_k_into(src, dst),
+        gguf::GgmlType::Q3_K => pad_q3_k_into(src, dst),
+        gguf::GgmlType::IQ3_XXS => repack_iq3_xxs_into(src, dst),
         _ => dst.copy_from_slice(src),
     }
 }

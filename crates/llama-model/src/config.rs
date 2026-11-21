@@ -47,6 +47,16 @@ impl DeltaNetConfig {
     }
 }
 
+/// Mixture of experts (`qwen35moe`): cada token passa por `n_usados` dos `n_expert` FFNs de
+/// `n_ff_exp`, escolhidos pelo roteador, mais o expert compartilhado — que é o FFN denso de
+/// `LlamaConfig::n_ff`. Ver `docs/planos/2026-11-20-qwen38-35b-moe.md`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MoeConfig {
+    pub n_expert: usize,
+    pub n_usados: usize,
+    pub n_ff_exp: usize,
+}
+
 /// Hiperparâmetros do modelo Llama necessários ao forward f32.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LlamaConfig {
@@ -65,6 +75,8 @@ pub struct LlamaConfig {
     pub eos_id: u32,
     /// `Some` nas arquiteturas híbridas (`qwen35`); `None` no transformer denso.
     pub delta_net: Option<DeltaNetConfig>,
+    /// `Some` no MoE (`qwen35moe`); aí `n_ff` é o FFN do expert compartilhado.
+    pub moe: Option<MoeConfig>,
     /// Blocos MTP/NextN empilhados depois das `n_layer` camadas. Carregados pelo
     /// llama.cpp para speculative decoding e **ignorados** aqui: não participam do
     /// forward normal.
@@ -151,6 +163,21 @@ impl LlamaConfig {
                 Some(MetadataValue::String(m)) if m == "gpt2"
             ),
         };
+        let moe = if f.metadata.contains_key(&p("expert_count")) {
+            Some(MoeConfig {
+                n_expert: u(&p("expert_count"))?,
+                n_usados: u(&p("expert_used_count"))?,
+                n_ff_exp: u(&p("expert_feed_forward_length"))?,
+            })
+        } else {
+            None
+        };
+        // No MoE o FFN denso que sobra é o do expert compartilhado.
+        let n_ff = if moe.is_some() && !f.metadata.contains_key(&p("feed_forward_length")) {
+            u(&p("expert_shared_feed_forward_length"))?
+        } else {
+            u(&p("feed_forward_length"))?
+        };
         let n_layer_nextn = match f.metadata.get(&p("nextn_predict_layers")) {
             Some(v) => usize::try_from(v.as_u32("nextn_predict_layers")?)
                 .map_err(|_| ModelError::Overflow)?,
@@ -170,7 +197,7 @@ impl LlamaConfig {
             n_head,
             n_head_kv: u(&p("attention.head_count_kv"))?,
             head_dim,
-            n_ff: u(&p("feed_forward_length"))?,
+            n_ff,
             rope_dim,
             rms_eps: f
                 .get(&p("attention.layer_norm_rms_epsilon"))?
@@ -181,6 +208,7 @@ impl LlamaConfig {
             bos_id: f.get("tokenizer.ggml.bos_token_id")?.as_u32("bos")?,
             eos_id: f.get("tokenizer.ggml.eos_token_id")?.as_u32("eos")?,
             delta_net,
+            moe,
             n_layer_nextn,
             add_bos,
         })

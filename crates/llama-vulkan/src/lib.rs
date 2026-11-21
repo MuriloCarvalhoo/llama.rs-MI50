@@ -61,3 +61,9 @@ pub(crate) const MUL_MM_SPV: &[u8] = include_bytes!(concat!(env!("MUL_MM_SPV")))
 pub(crate) const MUL_MM_Q4K_SPV: &[u8] = include_bytes!(concat!(env!("MUL_MM_Q4K_SPV")));
 #[allow(dead_code)]
 pub(crate) const ADD_SPV: &[u8] = include_bytes!(concat!(env!("ADD_SPV")));
+// MoE do qwen35moe — ver docs/planos/2026-11-20-qwen38-35b-moe.md.
+pub(crate) const Q3_K_MATVEC_SPV: &[u8] = include_bytes!(concat!(env!("Q3_K_MATVEC_SPV")));
+pub(crate) const MOE_MATVEC_SPV: &[u8] = include_bytes!(concat!(env!("MOE_MATVEC_SPV")));
+pub(crate) const MOE_ROUTER_SPV: &[u8] = include_bytes!(concat!(env!("MOE_ROUTER_SPV")));
+pub(crate) const MOE_TOPK_SPV: &[u8] = include_bytes!(concat!(env!("MOE_TOPK_SPV")));
+pub(crate) const MOE_COMBINE_SPV: &[u8] = include_bytes!(concat!(env!("MOE_COMBINE_SPV")));

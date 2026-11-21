@@ -353,6 +353,89 @@ pub fn dispatch_q5_k_matvec(
 /// A saída sai coluna a coluna: `y[c * n_out + linha]`.
 // Contexto Vulkan (3) + pesos/ativacoes (2) + dimensoes (3): agrupa-los numa struct
 // so daria um wrapper de uso unico. Mesmo criterio do `plano_delta`.
+/// Matvec Q3_K (`q3_k_matvec.comp`), com os superblocos de 110 B alinhados em 112 como no
+/// upload. Mesma geometria do Q4_K.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_q3_k_matvec(
+    ctx: &VulkanContext,
+    phys: &VulkanPhysicalDevice,
+    dev: &VulkanDevice,
+    w_bytes: &[u8],
+    x_f32: &[f32],
+    n_in: usize,
+    n_out: usize,
+    cols: usize,
+) -> Result<Vec<f32>, MatmulError> {
+    let mut alinhado = vec![0u8; w_bytes.len() / 110 * 112];
+    crate::tensor::pad_q3_k_into(w_bytes, &mut alinhado);
+    let (wg, rows) = crate::resident_forward::matvec_geom();
+    let cols_u32 =
+        u32::try_from(cols).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?;
+    dispatch_k_matvec(
+        ctx,
+        phys,
+        dev,
+        crate::Q3_K_MATVEC_SPV,
+        &alinhado,
+        x_f32,
+        n_in,
+        n_out,
+        cols,
+        wg / 64 * rows,
+        &[(0, wg), (1, rows), (2, cols_u32)],
+    )
+}
+
+/// Matvec dos experts (`moe_matvec.comp`): `w_bytes` é o tensor 3D como está no GGUF
+/// (Q3_K ou IQ3_XXS), `x_f32` traz uma ativação por coluna e `ids` o expert de cada slot.
+/// A saída tem um bloco de `n_out` por slot.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_moe_matvec(
+    ctx: &VulkanContext,
+    phys: &VulkanPhysicalDevice,
+    dev: &VulkanDevice,
+    ty: gguf::GgmlType,
+    w_bytes: &[u8],
+    x_f32: &[f32],
+    ids: &[u32],
+    n_in: usize,
+    n_out: usize,
+    n_usados: usize,
+    x_por_slot: bool,
+) -> Result<Vec<f32>, MatmulError> {
+    let (tipo, bloco) = match ty {
+        gguf::GgmlType::Q3_K => (0, 110),
+        gguf::GgmlType::IQ3_XXS => (1, 98),
+        _ => return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT)),
+    };
+    let mut alinhado = vec![0u8; w_bytes.len() / bloco * 112];
+    if tipo == 0 {
+        crate::tensor::pad_q3_k_into(w_bytes, &mut alinhado);
+    } else {
+        crate::tensor::repack_iq3_xxs_into(w_bytes, &mut alinhado);
+    }
+    let u = |v: usize| u32::try_from(v).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN));
+    dispatch_k_matvec_ext(
+        ctx,
+        phys,
+        dev,
+        crate::MOE_MATVEC_SPV,
+        &alinhado,
+        x_f32,
+        n_in,
+        n_out,
+        x_f32.len() / n_in,
+        8,
+        &[(0, tipo)],
+        &Extra {
+            ids: Some(ids),
+            push23: [u(n_usados)?, u32::from(x_por_slot)],
+            groups_y: Some(u(ids.len())?),
+            saida_floats: ids.len() * n_out,
+        },
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_q4_k_matvec(
     ctx: &VulkanContext,
@@ -565,6 +648,52 @@ fn dispatch_k_matvec(
     // residente é criada — o shader não tem default utilizável para `local_size_x_id`.
     spec: &[(u32, u32)],
 ) -> Result<Vec<f32>, MatmulError> {
+    dispatch_k_matvec_ext(
+        ctx,
+        phys,
+        dev,
+        spv,
+        w_bytes,
+        x_f32,
+        n_in,
+        n_out,
+        cols,
+        rows_por_wg,
+        spec,
+        &Extra {
+            ids: None,
+            push23: [0, 0],
+            groups_y: None,
+            saida_floats: cols * n_out,
+        },
+    )
+}
+
+/// O que o matvec dos experts (`moe_matvec.comp`) muda no contrato do matvec denso: o
+/// binding 4 vira os ids dos experts, os dois últimos campos do push viram `n_usados` e
+/// `x_por_slot`, o grid Y vira o slot e a saída tem um bloco de `n_out` por slot.
+struct Extra<'a> {
+    ids: Option<&'a [u32]>,
+    push23: [u32; 2],
+    groups_y: Option<u32>,
+    saida_floats: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_k_matvec_ext(
+    ctx: &VulkanContext,
+    phys: &VulkanPhysicalDevice,
+    dev: &VulkanDevice,
+    spv: &[u8],
+    w_bytes: &[u8],
+    x_f32: &[f32],
+    n_in: usize,
+    n_out: usize,
+    cols: usize,
+    rows_por_wg: u32,
+    spec: &[(u32, u32)],
+    extra: &Extra<'_>,
+) -> Result<Vec<f32>, MatmulError> {
     use crate::pipeline::{ComputePipeline, PushConstants};
     use crate::tensor::{alloc_and_bind, create_buf, one_shot_copy};
 
@@ -608,8 +737,15 @@ fn dispatch_k_matvec(
     let xd_bytes = unsafe { std::slice::from_raw_parts(xd.as_ptr().cast::<u8>(), xd.len() * 4) };
     let (xq_buf, xq_mem) = upload(xq_bytes)?;
     let (xd_buf, xd_mem) = upload(xd_bytes)?;
+    let ids = match extra.ids {
+        // SAFETY: Vec<u32> POD contíguo, reinterpretado como bytes.
+        Some(v) => Some(upload(unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), v.len() * 4)
+        })?),
+        None => None,
+    };
 
-    let y_size = (cols * n_out * size_of::<f32>()) as vk::DeviceSize;
+    let y_size = (extra.saida_floats * size_of::<f32>()) as vk::DeviceSize;
     let y_buf = create_buf(
         d,
         y_size,
@@ -621,8 +757,8 @@ fn dispatch_k_matvec(
     let push = PushConstants {
         n_in: u32::try_from(n_in).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?,
         n_out: u32::try_from(n_out).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?,
-        row_offset: 0,
-        tem_bias: 0,
+        row_offset: extra.push23[0],
+        tem_bias: extra.push23[1],
     };
     // Descriptor pool + set com os 5 bindings (pesos, xq, xd, saída, bias). Sem bias
     // aqui: o binding 4 recebe `xd` só para completar o layout, e `tem_bias: 0` o ignora.
@@ -668,10 +804,17 @@ fn dispatch_k_matvec(
             offset: 0,
             range: y_size,
         },
-        vk::DescriptorBufferInfo {
-            buffer: xd_buf,
-            offset: 0,
-            range: xd_bytes.len() as vk::DeviceSize,
+        match (ids, extra.ids) {
+            (Some((b, _)), Some(v)) => vk::DescriptorBufferInfo {
+                buffer: b,
+                offset: 0,
+                range: (v.len() * 4) as vk::DeviceSize,
+            },
+            _ => vk::DescriptorBufferInfo {
+                buffer: xd_buf,
+                offset: 0,
+                range: xd_bytes.len() as vk::DeviceSize,
+            },
         },
     ];
     let writes: Vec<vk::WriteDescriptorSet> = infos
@@ -727,7 +870,8 @@ fn dispatch_k_matvec(
         // O GEMM fatia blocos maiores que 32 em tiles de 32 colunas, um por grupo em Y; os
         // matvec-COLS nunca passam de 32, então para eles isto é 1.
         let tiles_y = u32::try_from(cols.div_ceil(32)).unwrap_or(1).max(1);
-        d.cmd_dispatch(cmd, push.n_out.div_ceil(rows_por_wg), tiles_y, 1);
+        let grupos_y = extra.groups_y.unwrap_or(tiles_y);
+        d.cmd_dispatch(cmd, push.n_out.div_ceil(rows_por_wg), grupos_y, 1);
         d.end_command_buffer(cmd)?;
         let submit = vk::SubmitInfo {
             command_buffer_count: 1,
@@ -743,8 +887,8 @@ fn dispatch_k_matvec(
         let read_mem = alloc_and_bind(ctx, phys, d, read, true)?;
         one_shot_copy(d, dev.queue, dev.cmd_pool, y_buf, read, y_size)?;
         let ptr = d.map_memory(read_mem, 0, y_size, vk::MemoryMapFlags::empty())?;
-        let mut v = vec![0f32; cols * n_out];
-        std::ptr::copy_nonoverlapping(ptr.cast::<f32>(), v.as_mut_ptr(), cols * n_out);
+        let mut v = vec![0f32; extra.saida_floats];
+        std::ptr::copy_nonoverlapping(ptr.cast::<f32>(), v.as_mut_ptr(), extra.saida_floats);
         d.unmap_memory(read_mem);
         d.destroy_buffer(read, None);
         d.free_memory(read_mem, None);
@@ -757,6 +901,10 @@ fn dispatch_k_matvec(
         pipe.destroy(d);
         d.destroy_buffer(w_buf, None);
         d.free_memory(w_mem, None);
+        if let Some((b, m)) = ids {
+            d.destroy_buffer(b, None);
+            d.free_memory(m, None);
+        }
         d.destroy_buffer(xq_buf, None);
         d.free_memory(xq_mem, None);
         d.destroy_buffer(xd_buf, None);

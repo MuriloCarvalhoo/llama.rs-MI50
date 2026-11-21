@@ -39,11 +39,23 @@ pub enum MixerRaw<'a> {
 }
 
 /// Pesos quantizados de uma camada, emprestados do buffer do GGUF (sem cópia).
+///
+/// Num MoE, `ffn_gate/up/down` são os do expert compartilhado (`*_shexp`), e os experts
+/// roteados vêm em `moe`. O roteador é f32 e fica em [`AuxLayer::roteador`].
 pub struct GpuLayerRaw<'a> {
     pub mixer: MixerRaw<'a>,
     pub ffn_gate: QTensor<'a>,
     pub ffn_up: QTensor<'a>,
     pub ffn_down: QTensor<'a>,
+    pub moe: Option<MoeRaw<'a>>,
+}
+
+/// Experts roteados de uma camada MoE: tensores 3D com um expert depois do outro —
+/// `[n_expert][n_ff_exp][n_embd]` no gate/up e `[n_expert][n_embd][n_ff_exp]` no down.
+pub struct MoeRaw<'a> {
+    pub gate_exps: QTensor<'a>,
+    pub up_exps: QTensor<'a>,
+    pub down_exps: QTensor<'a>,
 }
 
 impl<'a> GpuLayerRaw<'a> {
@@ -69,7 +81,14 @@ impl<'a> GpuLayerRaw<'a> {
                 ssm_out,
             } => attn_qkv.bytes.len() + attn_gate.bytes.len() + ssm_out.bytes.len(),
         };
-        mixer + self.ffn_gate.bytes.len() + self.ffn_up.bytes.len() + self.ffn_down.bytes.len()
+        let moe = self.moe.as_ref().map_or(0, |m| {
+            m.gate_exps.bytes.len() + m.up_exps.bytes.len() + m.down_exps.bytes.len()
+        });
+        mixer
+            + self.ffn_gate.bytes.len()
+            + self.ffn_up.bytes.len()
+            + self.ffn_down.bytes.len()
+            + moe
     }
 
     /// Atalho para as camadas densas, onde o mixer é sempre atenção.
@@ -140,9 +159,12 @@ impl<'a> GpuRawWeights<'a> {
                 GgmlType::Q5_K => (256, 176),
                 GgmlType::Q6_K => (256, 210),
                 GgmlType::Q4_K => (256, 144),
+                GgmlType::Q3_K => (256, 110),
+                GgmlType::IQ3_XXS => (256, 98),
                 other => {
                     return Err(ModelError::Gpu(format!(
-                        "tensor {name} é {other:?} — a GPU só tem shader para Q8_0, Q5_K, Q6_K e Q4_K"
+                        "tensor {name} é {other:?} — a GPU só tem shader para Q8_0, Q3_K, Q4_K, \
+                         Q5_K, Q6_K e IQ3_XXS"
                     )));
                 }
             };
@@ -168,6 +190,8 @@ impl<'a> GpuRawWeights<'a> {
             })
         };
 
+        // No MoE o FFN denso da camada é o expert compartilhado.
+        let shexp = if cfg.moe.is_some() { "_shexp" } else { "" };
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for l in 0..cfg.n_layer {
             let p = |s: &str| format!("blk.{l}.{s}");
@@ -198,9 +222,29 @@ impl<'a> GpuRawWeights<'a> {
             };
             layers.push(GpuLayerRaw {
                 mixer,
-                ffn_gate: read(&p("ffn_gate.weight"), cfg.n_embd, cfg.n_ff)?,
-                ffn_up: read(&p("ffn_up.weight"), cfg.n_embd, cfg.n_ff)?,
-                ffn_down: read(&p("ffn_down.weight"), cfg.n_ff, cfg.n_embd)?,
+                ffn_gate: read(&p(&format!("ffn_gate{shexp}.weight")), cfg.n_embd, cfg.n_ff)?,
+                ffn_up: read(&p(&format!("ffn_up{shexp}.weight")), cfg.n_embd, cfg.n_ff)?,
+                ffn_down: read(&p(&format!("ffn_down{shexp}.weight")), cfg.n_ff, cfg.n_embd)?,
+                moe: match &cfg.moe {
+                    Some(m) => Some(MoeRaw {
+                        gate_exps: read(
+                            &p("ffn_gate_exps.weight"),
+                            cfg.n_embd,
+                            m.n_expert * m.n_ff_exp,
+                        )?,
+                        up_exps: read(
+                            &p("ffn_up_exps.weight"),
+                            cfg.n_embd,
+                            m.n_expert * m.n_ff_exp,
+                        )?,
+                        down_exps: read(
+                            &p("ffn_down_exps.weight"),
+                            m.n_ff_exp,
+                            m.n_expert * cfg.n_embd,
+                        )?,
+                    }),
+                    None => None,
+                },
             });
         }
         let output = read("output.weight", cfg.n_embd, cfg.vocab)?;
@@ -235,6 +279,7 @@ impl<'a> GpuRawWeights<'a> {
                     ffn_gate: read(&p("ffn_gate.weight"), cfg.n_embd, cfg.n_ff)?,
                     ffn_up: read(&p("ffn_up.weight"), cfg.n_embd, cfg.n_ff)?,
                     ffn_down: read(&p("ffn_down.weight"), cfg.n_ff, cfg.n_embd)?,
+                    moe: None,
                 },
             })
         } else {
@@ -352,6 +397,10 @@ pub struct AuxLayer {
     pub k_norm: Option<Vec<f32>>,
     /// `Some` nas camadas de atenção linear do `qwen35`.
     pub delta: Option<DeltaAux>,
+    /// `Some` no MoE: `ffn_gate_inp` ([n_expert][n_embd]) com `ffn_gate_inp_shexp`
+    /// ([n_embd]) anexado como última linha — o gate do expert compartilhado sai do mesmo
+    /// matvec do roteador.
+    pub roteador: Option<Vec<f32>>,
 }
 
 /// Pesos f32 de uma camada de atenção linear (gated delta net).
@@ -537,6 +586,14 @@ impl<'a> GpuAuxWeights<'a> {
                 }
                 _ => None,
             };
+            let roteador = match &cfg.moe {
+                Some(m) => {
+                    let mut r = f32s(&p("ffn_gate_inp.weight"), m.n_expert * cfg.n_embd)?;
+                    r.extend(f32s(&p("ffn_gate_inp_shexp.weight"), cfg.n_embd)?);
+                    Some(r)
+                }
+                None => None,
+            };
             layers.push(AuxLayer {
                 attn_norm: f32s(&p("attn_norm.weight"), cfg.n_embd)?,
                 ffn_norm: f32s(&segunda_norma, cfg.n_embd)?,
@@ -546,6 +603,7 @@ impl<'a> GpuAuxWeights<'a> {
                 q_norm,
                 k_norm,
                 delta,
+                roteador,
             });
         }
 
@@ -585,6 +643,7 @@ impl<'a> GpuAuxWeights<'a> {
                         .map(|_| f32s(&p("attn_k_norm.weight"), cfg.head_dim))
                         .transpose()?,
                     delta: None,
+                    roteador: None,
                 },
             })
         } else {
@@ -971,6 +1030,7 @@ impl Model<'_> {
                 q_norm: None,
                 k_norm: None,
                 delta: None,
+                roteador: None,
             });
         }
         Ok(GpuAuxWeights {
@@ -1411,6 +1471,7 @@ mod tests {
             bos_id: 0,
             eos_id: 3,
             delta_net: None,
+            moe: None,
             n_layer_nextn: 0,
             add_bos: false,
         }

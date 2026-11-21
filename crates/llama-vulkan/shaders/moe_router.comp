@@ -1,0 +1,36 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+// Logits do roteador de um MoE: l[t][r] = W[r, :] · x[t, :], com W e x em f32.
+//
+// W é o `ffn_gate_inp` ([n_expert][n_in]) com o `ffn_gate_inp_shexp` ([n_in]) anexado como
+// última linha — o truque do Strata: o gate do expert compartilhado sai do mesmo dispatch.
+// x é a saída f32 da norma do FFN (`b_normed`). Uma wave por linha, um token por grid Y.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf { vec4 w[]; } weight_buf;
+layout(set = 0, binding = 1) readonly buffer XBuf { vec4 x[]; } x_buf;
+layout(set = 0, binding = 2) writeonly buffer OutBuf { float l[]; } out_buf;
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint n_linhas;
+} pc;
+
+void main() {
+    uint lane = gl_SubgroupInvocationID;
+    uint linha = gl_WorkGroupID.x * 4u + gl_SubgroupID;
+    if (linha >= pc.n_linhas) { return; }
+    uint t = gl_WorkGroupID.y;
+    uint n4 = pc.n_in / 4u;
+    float acc = 0.0;
+    for (uint i = lane; i < n4; i += 64u) {
+        acc += dot(weight_buf.w[linha * n4 + i], x_buf.x[t * n4 + i]);
+    }
+    float s = subgroupAdd(acc);
+    if (lane == 0u) {
+        out_buf.l[t * pc.n_linhas + linha] = s;
+    }
+}

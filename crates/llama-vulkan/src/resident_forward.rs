@@ -482,6 +482,8 @@ pub(crate) struct Cfg {
     pub shard: Shard,
     /// `Some` nas arquiteturas híbridas (qwen35).
     pub delta_net: Option<llama_model::DeltaNetConfig>,
+    /// `Some` no MoE (qwen35moe); `n_ff` é então o FFN do expert compartilhado.
+    pub moe: Option<llama_model::MoeConfig>,
     /// Tokens por bloco do prefill em batch (ver `batch_size`). Dimensiona as ativações.
     pub n_batch: usize,
 }
@@ -492,6 +494,35 @@ pub(crate) struct LayerQ {
     pub ffn_gate: QWeight,
     pub ffn_up: QWeight,
     pub ffn_down: QWeight,
+    /// Experts roteados do MoE; `ffn_*` acima são então os do expert compartilhado.
+    pub moe: Option<MoeQ>,
+}
+
+/// Tensores 3D dos experts de uma camada MoE, um expert depois do outro.
+pub(crate) struct MoeQ {
+    pub gate_exps: QWeight,
+    pub up_exps: QWeight,
+    pub down_exps: QWeight,
+}
+
+/// Ativações do caminho MoE, compartilhadas pelas camadas do shard. Todas por token do
+/// bloco, como as demais.
+pub(crate) struct MoeBufs {
+    /// Logits do roteador + o do gate do compartilhado: [n_expert + 1].
+    pub logits: Buf,
+    /// Experts escolhidos: [n_usados] (u32).
+    pub ids: Buf,
+    /// Pesos dos escolhidos + sigmoid do gate do compartilhado: [n_usados + 1].
+    pub w: Buf,
+    /// gate, up e SwiGLU por slot: [n_usados * n_ff_exp].
+    pub g: Buf,
+    pub u: Buf,
+    pub act: Buf,
+    /// SwiGLU quantizado para o `down` dos experts.
+    pub xq: Buf,
+    pub xd: Buf,
+    /// Saída do `down` de cada slot: [n_usados * n_embd].
+    pub y: Buf,
 }
 
 /// Pesos quantizados do que fica entre as duas normas da camada, já na VRAM.
@@ -528,6 +559,8 @@ pub(crate) struct LayerAux {
     pub k_norm: Option<Buf>,
     /// Pesos e estado residente da atenção linear.
     pub delta: Option<DeltaBufs>,
+    /// Roteador do MoE em f32, com o gate do compartilhado como última linha.
+    pub roteador: Option<Buf>,
 }
 
 /// Ativações intermediárias do caminho de atenção linear, compartilhadas por todas as
@@ -626,6 +659,16 @@ pub(crate) enum PipeId {
     DnL2Qk,
     /// Portão sigmoide + quantização em int8 na mesma passada — `gate_quant.comp`.
     GateQuant,
+    /// Q3_K denso, nas três larguras (decode, bloco de prefill, verify).
+    MatvecQ3K,
+    MatvecQ3KB,
+    MatvecQ3KV,
+    /// Matvec dos experts escolhidos (`moe_matvec.comp`), Q3_K e IQ3_XXS.
+    MoeQ3K,
+    MoeIq3,
+    MoeRouter,
+    MoeTopk,
+    MoeCombine,
 }
 
 impl PipeId {
@@ -662,6 +705,14 @@ impl PipeId {
             PipeId::DnNorm => "dn_norm",
             PipeId::DnL2Qk => "dn_l2_qk",
             PipeId::GateQuant => "gate_quant",
+            PipeId::MatvecQ3K => "matvec_q3k",
+            PipeId::MatvecQ3KB => "matvec_q3k_b",
+            PipeId::MatvecQ3KV => "matvec_q3k_v",
+            PipeId::MoeQ3K => "moe_q3k",
+            PipeId::MoeIq3 => "moe_iq3",
+            PipeId::MoeRouter => "moe_router",
+            PipeId::MoeTopk => "moe_topk",
+            PipeId::MoeCombine => "moe_combine",
         }
     }
 
@@ -690,7 +741,17 @@ impl PipeId {
             | PipeId::MatvecV
             | PipeId::MatvecQ5KV
             | PipeId::MatvecQ6KV
-            | PipeId::MatvecQ4KV => (&[0, 1, 2, 4], &[3]),
+            | PipeId::MatvecQ4KV
+            | PipeId::MatvecQ3K
+            | PipeId::MatvecQ3KB
+            | PipeId::MatvecQ3KV
+            // weight, xq, xd, ids → out
+            | PipeId::MoeQ3K
+            | PipeId::MoeIq3 => (&[0, 1, 2, 4], &[3]),
+            PipeId::MoeRouter => (&[0, 1], &[2]),
+            PipeId::MoeTopk => (&[0], &[1, 2]),
+            // a saída do FFN é inout: entra o compartilhado, sai a soma.
+            PipeId::MoeCombine => (&[0, 1, 2], &[0]),
             PipeId::Attention | PipeId::AttentionSplit => (&[0, 1, 2], &[3]),
             PipeId::AttnReduce => (&[0], &[1]),
             PipeId::QuantizeX => (&[0], &[1, 2]),
@@ -938,6 +999,8 @@ pub(crate) struct ResidentState<'w> {
     pub b_ffn: Buf,
     /// Buffers do caminho de atenção linear (qwen35). `None` nas arquiteturas densas.
     pub dn: Option<DnBufs>,
+    /// Buffers do MoE (qwen35moe). `None` nos modelos sem experts.
+    pub moe: Option<MoeBufs>,
     /// Ativacao quantizada em int8 (8 uints por bloco de 32) e escala por bloco,
     /// produzidas uma vez por matvec pelo dispatch `QuantizeX`.
     pub b_xq: Buf,
@@ -1093,6 +1156,15 @@ pub struct ResidentForward<'ctx> {
     pub(crate) dn_norm: ComputePipeline,
     pub(crate) dn_l2_qk: ComputePipeline,
     pub(crate) gate_quant: ComputePipeline,
+    // MoE (qwen35moe) e o Q3_K denso.
+    pub(crate) matvec_q3k: ComputePipeline,
+    pub(crate) matvec_q3k_b: ComputePipeline,
+    pub(crate) matvec_q3k_v: ComputePipeline,
+    pub(crate) moe_q3k: ComputePipeline,
+    pub(crate) moe_iq3: ComputePipeline,
+    pub(crate) moe_router: ComputePipeline,
+    pub(crate) moe_topk: ComputePipeline,
+    pub(crate) moe_combine: ComputePipeline,
     pub(crate) desc_pool: vk::DescriptorPool,
     pub(crate) state: Option<ResidentState<'ctx>>,
     /// Clock fixo enquanto houver geração (ver `pstate.rs`). Só no backend carregado.
@@ -1425,6 +1497,18 @@ impl<'ctx> ResidentForward<'ctx> {
         let dn_l2_qk = ComputePipeline::with(d, crate::DN_L2_QK_SPV, 3, 16, &[])?;
         // (dst inout, gate, xq, xd) + n, head_dim.
         let gate_quant = ComputePipeline::with(d, crate::GATE_QUANT_SPV, 4, 8, &[])?;
+        // Q3_K denso: mesma geometria e mesmo contrato do Q4_K, nas três larguras.
+        let matvec_q3k = ComputePipeline::with(d, crate::Q3_K_MATVEC_SPV, 5, push_mv, &geom)?;
+        let matvec_q3k_b = ComputePipeline::with(d, crate::Q3_K_MATVEC_SPV, 5, push_mv, &geom_b)?;
+        let matvec_q3k_v = ComputePipeline::with(d, crate::Q3_K_MATVEC_SPV, 5, push_mv, &geom_v)?;
+        // Experts: (peso, xq, xd, saída, ids) + n_in, n_out, n_usados, x_por_slot.
+        let moe_q3k = ComputePipeline::with(d, crate::MOE_MATVEC_SPV, 5, 16, &[(0, 0)])?;
+        let moe_iq3 = ComputePipeline::with(d, crate::MOE_MATVEC_SPV, 5, 16, &[(0, 1)])?;
+        // (peso, x, logits) + n_in, n_linhas; (logits, ids, w) + n_expert, n_usados;
+        // (f inout, y, w) + n_embd, n_usados.
+        let moe_router = ComputePipeline::with(d, crate::MOE_ROUTER_SPV, 3, 8, &[])?;
+        let moe_topk = ComputePipeline::with(d, crate::MOE_TOPK_SPV, 3, 8, &[])?;
+        let moe_combine = ComputePipeline::with(d, crate::MOE_COMBINE_SPV, 3, 8, &[])?;
 
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -1479,6 +1563,14 @@ impl<'ctx> ResidentForward<'ctx> {
             dn_norm,
             dn_l2_qk,
             gate_quant,
+            matvec_q3k,
+            matvec_q3k_b,
+            matvec_q3k_v,
+            moe_q3k,
+            moe_iq3,
+            moe_router,
+            moe_topk,
+            moe_combine,
             desc_pool,
             state: None,
             pstate: None,
@@ -1581,6 +1673,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 rms_eps: config.rms_eps,
                 shard,
                 delta_net: config.delta_net.clone(),
+                moe: config.moe.clone(),
                 n_batch: batch_do_modelo(raw),
             };
             let nbatch = cfg.n_batch;
@@ -1655,11 +1748,28 @@ impl<'ctx> ResidentForward<'ctx> {
                         }
                     }
                 };
+                let moe = match (&lw.moe, &cfg.moe) {
+                    (Some(m), Some(mc)) => {
+                        let n_rot = mc.n_expert * mc.n_ff_exp;
+                        Some(MoeQ {
+                            gate_exps: up_q(&mut upl, &m.gate_exps, cfg.n_embd, n_rot)?,
+                            up_exps: up_q(&mut upl, &m.up_exps, cfg.n_embd, n_rot)?,
+                            down_exps: up_q(
+                                &mut upl,
+                                &m.down_exps,
+                                mc.n_ff_exp,
+                                mc.n_expert * cfg.n_embd,
+                            )?,
+                        })
+                    }
+                    _ => None,
+                };
                 qw.push(LayerQ {
                     mixer,
                     ffn_gate: up_q(&mut upl, &lw.ffn_gate, cfg.n_embd, cfg.n_ff)?,
                     ffn_up: up_q(&mut upl, &lw.ffn_up, cfg.n_embd, cfg.n_ff)?,
                     ffn_down: up_q(&mut upl, &lw.ffn_down, cfg.n_ff, cfg.n_embd)?,
+                    moe,
                 });
             }
             let output_w = up_q(&mut upl, &raw.output, cfg.n_embd, cfg.vocab)?;
@@ -1736,6 +1846,7 @@ impl<'ctx> ResidentForward<'ctx> {
                         }
                         _ => None,
                     },
+                    roteador: mk_opt(&mut upl, &al.roteador)?,
                 });
             }
             let output_norm_buf = mk(&mut upl, &aux.output_norm)?;
@@ -1921,6 +2032,23 @@ impl<'ctx> ResidentForward<'ctx> {
                             normed: nf(value_dim)?,
                             xq: nf(value_dim / 32 * 8)?,
                             xd: nf(value_dim / 32)?,
+                        })
+                    }
+                    None => None,
+                },
+                moe: match config.moe.as_ref() {
+                    Some(m) => {
+                        let slots = m.n_usados * m.n_ff_exp;
+                        Some(MoeBufs {
+                            logits: nf(m.n_expert + 1)?,
+                            ids: nf(m.n_usados)?,
+                            w: nf(m.n_usados + 1)?,
+                            g: nf(slots)?,
+                            u: nf(slots)?,
+                            act: nf(slots)?,
+                            xq: nf(slots / 32 * 8)?,
+                            xd: nf(slots / 32)?,
+                            y: nf(m.n_usados * config.n_embd)?,
                         })
                     }
                     None => None,
@@ -3773,6 +3901,14 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::AttnReduce => &self.attn_reduce,
             PipeId::SwigluQuant => &self.swiglu_quant,
             PipeId::Add => &self.add,
+            PipeId::MatvecQ3K => &self.matvec_q3k,
+            PipeId::MatvecQ3KB => &self.matvec_q3k_b,
+            PipeId::MatvecQ3KV => &self.matvec_q3k_v,
+            PipeId::MoeQ3K => &self.moe_q3k,
+            PipeId::MoeIq3 => &self.moe_iq3,
+            PipeId::MoeRouter => &self.moe_router,
+            PipeId::MoeTopk => &self.moe_topk,
+            PipeId::MoeCombine => &self.moe_combine,
         }
     }
 
@@ -4051,7 +4187,15 @@ impl<'ctx> ResidentForward<'ctx> {
                         },
                         rows_q5k,
                     ),
-                    _ => (
+                    gguf::GgmlType::Q3_K => (
+                        match largura {
+                            Modo::Decode => PipeId::MatvecQ3K,
+                            Modo::Batch => PipeId::MatvecQ3KB,
+                            Modo::Verify => PipeId::MatvecQ3KV,
+                        },
+                        rows_q5k,
+                    ),
+                    gguf::GgmlType::Q6_K => (
                         match largura {
                             Modo::Decode => PipeId::MatvecQ6K,
                             Modo::Batch => PipeId::MatvecQ6KB,
@@ -4059,6 +4203,10 @@ impl<'ctx> ResidentForward<'ctx> {
                         },
                         8,
                     ),
+                    outro => {
+                        eprintln!("[plano] {outro:?} não tem matvec denso na GPU");
+                        return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+                    }
                 }
             };
             let mut op = mk(
@@ -4413,6 +4561,17 @@ impl<'ctx> ResidentForward<'ctx> {
             plan.extend(norma(&st.b_proj, &la.ffn_norm, true)?);
             plan.push(mv(&lq.ffn_gate, &st.b_gate, c.n_embd, c.n_ff)?);
             plan.push(mv(&lq.ffn_up, &st.b_up, c.n_embd, c.n_ff)?);
+            // Os experts do MoE leem a mesma entrada int8 do compartilhado (`b_xq`/`b_xd`),
+            // então entram **antes** do SwiGLU abaixo, que sobrescreve esses buffers. Só a
+            // soma final (`combine`) espera o `ffn_down` do compartilhado.
+            let moe = match (&lq.moe, &c.moe, &st.moe, &la.roteador) {
+                (Some(mq), Some(mc), Some(mb), Some(rot)) => {
+                    let (ops, combine) = self.plano_moe(st, mq, mc, mb, rot, n_tok)?;
+                    plan.extend(ops);
+                    Some(combine)
+                }
+                _ => None,
+            };
             // silu(gate) * up já saindo quantizado para o `ffn_down`: eram dois dispatches
             // em todas as camadas, com o swiglu escrevendo `b_act` inteiro e o quantize
             // relendo o mesmo buffer logo depois.
@@ -4429,6 +4588,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 PushSpec::Static(n_push(c.n_ff * n_tok)),
             )?);
             plan.push(mv(&lq.ffn_down, &st.b_ffn, c.n_ff, c.n_embd)?);
+            plan.extend(moe);
             // Sem `Add` aqui: o residual do FFN é somado pela norma da camada seguinte, ou
             // pela norma final logo abaixo.
         }
@@ -4492,6 +4652,146 @@ impl<'ctx> ResidentForward<'ctx> {
         }
 
         Ok(plan)
+    }
+
+    /// Ops dos experts roteados de uma camada MoE, depois do expert compartilhado já ter
+    /// escrito a sua saída em `b_ffn`:
+    ///
+    /// 1. roteador (f32, com o gate do compartilhado como última linha) sobre `b_normed`;
+    /// 2. top-k: ids e pesos dos escolhidos, e o sigmoid do gate — sem volta ao host;
+    /// 3. gate e up dos experts escolhidos, lendo a mesma ativação int8 do compartilhado
+    ///    (`b_xq`/`b_xd` com a norma do FFN — o chamador põe estas ops antes do SwiGLU do
+    ///    compartilhado, que sobrescreve esses buffers);
+    /// 4. SwiGLU quantizado por slot (em buffers próprios) e o `down` de cada expert;
+    /// 5. combine: `b_ffn = sigmoid(gate) * b_ffn + Σ w_k * y_k`, devolvido à parte porque
+    ///    só pode rodar depois do `ffn_down` do compartilhado.
+    fn plano_moe(
+        &self,
+        st: &ResidentState<'_>,
+        mq: &MoeQ,
+        mc: &llama_model::MoeConfig,
+        mb: &MoeBufs,
+        rot: &Buf,
+        n_tok: usize,
+    ) -> Result<(Vec<PlannedOp>, PlannedOp), MatmulError> {
+        let c = &st.cfg;
+        let nt = u32::try_from(n_tok).unwrap_or(1);
+        let u32s = |v: &[usize]| -> PushSpec {
+            PushSpec::Static(
+                v.iter()
+                    .flat_map(|&x| u32::try_from(x).unwrap_or(u32::MAX).to_le_bytes())
+                    .collect(),
+            )
+        };
+        let nbt = |n: usize| ((n * n_tok) * 4) as vk::DeviceSize;
+        let slots = mc.n_usados * n_tok;
+        let ff_slots = mc.n_usados * mc.n_ff_exp;
+        let moe_mv = |w: &QWeight,
+                      ativ: (&Buf, &Buf),
+                      dst: &Buf,
+                      n_in: usize,
+                      n_out: usize,
+                      x_por_slot: bool|
+         -> Result<PlannedOp, MatmulError> {
+            let pipe = match w.ty {
+                gguf::GgmlType::Q3_K => PipeId::MoeQ3K,
+                gguf::GgmlType::IQ3_XXS => PipeId::MoeIq3,
+                outro => {
+                    eprintln!("[plano] experts {outro:?} não têm matvec na GPU");
+                    return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+                }
+            };
+            let op = self.mk_op(
+                pipe,
+                &[
+                    (w.gpu.buffer, 0, w.gpu.size_bytes),
+                    (ativ.0.buffer, 0, ativ.0.size),
+                    (ativ.1.buffer, 0, ativ.1.size),
+                    (dst.buffer, 0, ((n_out * slots) * 4) as vk::DeviceSize),
+                    (mb.ids.buffer, 0, ((slots) * 4) as vk::DeviceSize),
+                ],
+                // 4 waves × 2 linhas por workgroup.
+                u32::try_from(n_out.div_ceil(8)).unwrap_or(u32::MAX),
+                u32s(&[n_in, n_out, mc.n_usados, usize::from(x_por_slot)]),
+            )?;
+            Ok(Self::com_y(op, u32::try_from(slots).unwrap_or(1)))
+        };
+
+        let mut plan = Vec::with_capacity(8);
+        plan.push(Self::com_y(
+            self.mk_op(
+                PipeId::MoeRouter,
+                &[
+                    (rot.buffer, 0, rot.size),
+                    (st.b_normed.buffer, 0, nbt(c.n_embd)),
+                    (mb.logits.buffer, 0, nbt(mc.n_expert + 1)),
+                ],
+                u32::try_from((mc.n_expert + 1).div_ceil(4)).unwrap_or(u32::MAX),
+                u32s(&[c.n_embd, mc.n_expert + 1]),
+            )?,
+            nt,
+        ));
+        plan.push(self.mk_op(
+            PipeId::MoeTopk,
+            &[
+                (mb.logits.buffer, 0, nbt(mc.n_expert + 1)),
+                (mb.ids.buffer, 0, nbt(mc.n_usados)),
+                (mb.w.buffer, 0, nbt(mc.n_usados + 1)),
+            ],
+            nt,
+            u32s(&[mc.n_expert, mc.n_usados]),
+        )?);
+        plan.push(moe_mv(
+            &mq.gate_exps,
+            (&st.b_xq, &st.b_xd),
+            &mb.g,
+            c.n_embd,
+            mc.n_ff_exp,
+            false,
+        )?);
+        plan.push(moe_mv(
+            &mq.up_exps,
+            (&st.b_xq, &st.b_xd),
+            &mb.u,
+            c.n_embd,
+            mc.n_ff_exp,
+            false,
+        )?);
+        plan.push(self.mk_op(
+            PipeId::SwigluQuant,
+            &[
+                (mb.g.buffer, 0, nbt(ff_slots)),
+                (mb.u.buffer, 0, nbt(ff_slots)),
+                (mb.act.buffer, 0, nbt(ff_slots)),
+                (mb.xq.buffer, 0, mb.xq.size),
+                (mb.xd.buffer, 0, mb.xd.size),
+            ],
+            u32::try_from((ff_slots * n_tok / 32).div_ceil(64)).unwrap_or(u32::MAX),
+            u32s(&[ff_slots * n_tok]),
+        )?);
+        plan.push(moe_mv(
+            &mq.down_exps,
+            (&mb.xq, &mb.xd),
+            &mb.y,
+            mc.n_ff_exp,
+            c.n_embd,
+            true,
+        )?);
+        let combine = Self::com_y(
+            self.mk_op(
+                PipeId::MoeCombine,
+                &[
+                    (st.b_ffn.buffer, 0, nbt(c.n_embd)),
+                    (mb.y.buffer, 0, nbt(mc.n_usados * c.n_embd)),
+                    (mb.w.buffer, 0, nbt(mc.n_usados + 1)),
+                ],
+                // `moe_combine.comp` tem workgroups de 256.
+                u32::try_from(c.n_embd.div_ceil(256)).unwrap_or(u32::MAX),
+                u32s(&[c.n_embd, mc.n_usados]),
+            )?,
+            nt,
+        );
+        Ok((plan, combine))
     }
 
     /// Plano da cabeça de multi-token prediction. Vazio quando o shard não tem o bloco.
@@ -5700,8 +6000,20 @@ impl Drop for ResidentForward<'_> {
                 lq.ffn_gate.gpu.destroy(d);
                 lq.ffn_up.gpu.destroy(d);
                 lq.ffn_down.gpu.destroy(d);
+                if let Some(m) = lq.moe {
+                    m.gate_exps.gpu.destroy(d);
+                    m.up_exps.gpu.destroy(d);
+                    m.down_exps.gpu.destroy(d);
+                }
             }
             st.output_w.gpu.destroy(d);
+            if let Some(m) = &st.moe {
+                for b in [
+                    &m.logits, &m.ids, &m.w, &m.g, &m.u, &m.act, &m.xq, &m.xd, &m.y,
+                ] {
+                    b.destroy(d);
+                }
+            }
             for (estado, janela) in st.snap.borrow().iter() {
                 estado.destroy(d);
                 janela.destroy(d);
@@ -5729,6 +6041,9 @@ impl Drop for ResidentForward<'_> {
                     b.destroy(d);
                 }
                 if let Some(b) = la.v_bias {
+                    b.destroy(d);
+                }
+                if let Some(b) = la.roteador {
                     b.destroy(d);
                 }
             }

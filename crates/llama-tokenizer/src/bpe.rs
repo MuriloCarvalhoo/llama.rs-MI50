@@ -77,8 +77,8 @@ fn pretok_re(pre: Pretok) -> &'static Regex {
     static QWEN35: OnceLock<Regex> = OnceLock::new();
     match pre {
         // Derivado de: (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|
-        //              ' '?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+
-        // (?!\S) removido — irrelevante para prompts ASCII sem trailing whitespace.
+        //              ' '?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+        // O crate `regex` não tem lookahead: o `\s+(?!\S)` é emulado em `pedacos_bpe`.
         Pretok::Qwen2 => QWEN2.get_or_init(|| {
             Regex::new(
                 r"(?:'[sStTdDmM]|'re|'RE|'ve|'VE|'ll|'LL)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+",
@@ -99,6 +99,33 @@ fn pretok_re(pre: Pretok) -> &'static Regex {
 
 // ── Tokenização ───────────────────────────────────────────────────────────────
 
+/// Os pedaços do pré-tokenizador, com o `\s+(?!\S)` do llama.cpp emulado: uma run só de
+/// espaço (que não termina em quebra de linha) seguida de não-espaço devolve o último
+/// caractere, que vai abrir o pedaço seguinte. É o que separa a indentação de código:
+/// `"\n        match"` vira `"\n"`, `"       "` (7) e `" match"`, e não `"        "` (8) e
+/// `"match"`. Sem isso, todo prompt de código indentado sai com tokens que o modelo não viu
+/// no treino.
+pub(crate) fn pedacos_bpe<'t>(re: &Regex, text: &'t str) -> Vec<&'t str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(m) = re.find_at(text, i) {
+        let mut fim = m.end();
+        let trecho = m.as_str();
+        let so_espaco = trecho.chars().all(char::is_whitespace);
+        let termina_em_quebra = trecho.ends_with(['\r', '\n']);
+        let seguido_de_texto = text[fim..]
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace());
+        if so_espaco && !termina_em_quebra && seguido_de_texto && trecho.chars().count() > 1 {
+            fim -= trecho.chars().next_back().map_or(0, char::len_utf8);
+        }
+        out.push(&text[m.start()..fim]);
+        i = fim;
+    }
+    out
+}
+
 /// Tokeniza `text` com BPE byte-level usando `merge_ranks`.
 ///
 /// Retorna Vec de IDs de tokens (sem BOS/EOS).
@@ -111,9 +138,7 @@ pub(crate) fn tokenize_bpe(
     let mut output = Vec::new();
     let mut char_buf = [0u8; 4];
 
-    for piece in pretok_re(vocab.pre).find_iter(text) {
-        let piece_str = piece.as_str();
-
+    for piece_str in pedacos_bpe(pretok_re(vocab.pre), text) {
         // Converte cada byte do piece para o char GPT-2 correspondente e busca o ID.
         let mut ids: Vec<u32> = piece_str
             .bytes()
@@ -229,10 +254,22 @@ mod tests {
     }
 
     fn pedacos(pre: Pretok, texto: &str) -> Vec<&str> {
-        pretok_re(pre)
-            .find_iter(texto)
-            .map(|m| m.as_str())
-            .collect()
+        pedacos_bpe(pretok_re(pre), texto)
+    }
+
+    /// O `\s+(?!\S)` do llama.cpp: a indentação devolve o último espaço para a palavra.
+    #[test]
+    fn indentacao_devolve_o_ultimo_espaco_para_a_palavra() {
+        for pre in [Pretok::Qwen2, Pretok::Qwen35] {
+            assert_eq!(
+                pedacos(pre, "{\n        match x"),
+                vec!["{\n", "       ", " match", " x"]
+            );
+            // espaço único antes da palavra já vai junto dela; no fim do texto fica inteiro
+            assert_eq!(pedacos(pre, "a  b  "), vec!["a", " ", " b", "  "]);
+            // antes de dígito o último espaço vira pedaço próprio, como no llama.cpp
+            assert_eq!(pedacos(pre, "x   1"), vec!["x", "  ", " ", "1"]);
+        }
     }
 
     /// A divergência que motiva a chave `pre`: com a marca combinante separada

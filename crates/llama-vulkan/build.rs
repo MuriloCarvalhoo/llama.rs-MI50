@@ -33,6 +33,12 @@ fn main() {
         ("mul_mm.comp", "MUL_MM_SPV"),
         // O GEMM do Q4_K, com passo de K = 64 (ver o cabeçalho).
         ("mul_mm_q4k.comp", "MUL_MM_Q4K_SPV"),
+        // Qwen3.8-35B-A3B: Q3_K denso, os experts (Q3_K/IQ3_XXS) e o roteamento do MoE.
+        ("q3_k_matvec.comp", "Q3_K_MATVEC_SPV"),
+        ("moe_matvec.comp", "MOE_MATVEC_SPV"),
+        ("moe_router.comp", "MOE_ROUTER_SPV"),
+        ("moe_topk.comp", "MOE_TOPK_SPV"),
+        ("moe_combine.comp", "MOE_COMBINE_SPV"),
     ];
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
