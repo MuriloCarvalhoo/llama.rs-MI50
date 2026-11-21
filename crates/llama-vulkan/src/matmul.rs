@@ -425,7 +425,7 @@ pub fn dispatch_moe_matvec(
         n_in,
         n_out,
         x_f32.len() / n_in,
-        8,
+        u(crate::resident_forward::linhas_por_wg_moe(n_in))?,
         &[(0, tipo)],
         &Extra {
             ids: Some(ids),
@@ -624,6 +624,40 @@ pub fn dispatch_mul_mm_q6k(
         cols,
         crate::resident_forward::GEMM_LINHAS_POR_WG,
         &[(0, cols_u32), (1, 2)],
+    )
+}
+
+/// GEMM Q3_K (`mul_mm.comp` com `TIPO = 3`), com os superblocos alinhados em 112 bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_mul_mm_q3k(
+    ctx: &VulkanContext,
+    phys: &VulkanPhysicalDevice,
+    dev: &VulkanDevice,
+    w_bytes: &[u8],
+    x_f32: &[f32],
+    n_in: usize,
+    n_out: usize,
+    cols: usize,
+) -> Result<Vec<f32>, MatmulError> {
+    if !crate::resident_forward::gemm_largura_ok(cols) {
+        return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+    }
+    let mut alinhado = vec![0u8; w_bytes.len() / 110 * 112];
+    crate::tensor::pad_q3_k_into(w_bytes, &mut alinhado);
+    let cols_u32 =
+        u32::try_from(cols).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?;
+    dispatch_k_matvec(
+        ctx,
+        phys,
+        dev,
+        crate::MUL_MM_SPV,
+        &alinhado,
+        x_f32,
+        n_in,
+        n_out,
+        cols,
+        crate::resident_forward::GEMM_LINHAS_POR_WG,
+        &[(0, cols_u32), (1, 3)],
     )
 }
 

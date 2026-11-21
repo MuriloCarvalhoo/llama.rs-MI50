@@ -112,6 +112,13 @@ fn batch_do_modelo(raw: &GpuRawWeights) -> usize {
     }
 }
 
+/// Linhas que um workgroup do `moe_matvec.comp` cobre: 4 waves × 2 linhas, vezes as
+/// linhas que cada wave pega por passada quando a linha tem menos de 8 superblocos.
+pub(crate) fn linhas_por_wg_moe(n_in: usize) -> usize {
+    let n_sb = n_in / 256;
+    8 * if n_sb >= 8 { 1 } else { 8 / n_sb.max(1) }
+}
+
 /// Maior largura do matvec-COLS: acima disso os `ROWS_PER_WAVE * COLS` acumuladores por lane
 /// estouram os registradores, e o prefill tem de ir pelo GEMM.
 const MATVEC_COLS_MAX: usize = 32;
@@ -257,6 +264,9 @@ fn gemm_para(cols: usize, ty: gguf::GgmlType) -> bool {
     let k56 = std::env::var("LLAMA_RS_GEMM_K56").map_or(true, |v| v != "0");
     let tipo_ok = match ty {
         gguf::GgmlType::Q4_K => true,
+        // Q3_K: o matvec-COLS dele no bloco 32 lia a 6–9 GB/s (35 ms de 91 por bloco no
+        // Qwen3.8-35B-A3B); o GEMM é o caminho do Q6_K com outro desempacotamento.
+        gguf::GgmlType::Q3_K => true,
         gguf::GgmlType::Q5_K => k56,
         // Acima de 32 colunas o matvec-COLS não existe mais: vai pelo GEMM de qualquer jeito.
         gguf::GgmlType::Q6_K => {
@@ -632,6 +642,8 @@ pub(crate) enum PipeId {
     MulMmQ4K,
     MulMmQ5K,
     MulMmQ6K,
+    /// O mesmo GEMM para Q3_K (`TIPO = 3`).
+    MulMmQ3K,
     /// As mesmas quatro com `COLS = VERIFY_TOK`: só o plano de verify do MTP as usa.
     MatvecV,
     MatvecQ5KV,
@@ -685,6 +697,7 @@ impl PipeId {
             PipeId::MulMmQ4K => "mul_mm_q4k",
             PipeId::MulMmQ5K => "mul_mm_q5k",
             PipeId::MulMmQ6K => "mul_mm_q6k",
+            PipeId::MulMmQ3K => "mul_mm_q3k",
             PipeId::MatvecV => "matvec_v",
             PipeId::MatvecQ5KV => "matvec_q5k_v",
             PipeId::MatvecQ6KV => "matvec_q6k_v",
@@ -738,6 +751,7 @@ impl PipeId {
             | PipeId::MulMmQ4K
             | PipeId::MulMmQ5K
             | PipeId::MulMmQ6K
+            | PipeId::MulMmQ3K
             | PipeId::MatvecV
             | PipeId::MatvecQ5KV
             | PipeId::MatvecQ6KV
@@ -1130,6 +1144,7 @@ pub struct ResidentForward<'ctx> {
     /// O mesmo GEMM para Q5_K e Q6_K (`TIPO` = 1 e 2 no shader).
     pub(crate) mul_mm_q5k: ComputePipeline,
     pub(crate) mul_mm_q6k: ComputePipeline,
+    pub(crate) mul_mm_q3k: ComputePipeline,
     // As mesmas quatro com COLS = VERIFY_TOK, para o plano de verify do MTP.
     pub(crate) matvec_v: ComputePipeline,
     pub(crate) matvec_q5k_v: ComputePipeline,
@@ -1441,6 +1456,8 @@ impl<'ctx> ResidentForward<'ctx> {
             ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, gemm_cols), (1, 1)])?;
         let mul_mm_q6k =
             ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, gemm_cols), (1, 2)])?;
+        let mul_mm_q3k =
+            ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, gemm_cols), (1, 3)])?;
         // Verify do MTP: `COLS = 2` fixo, com a geometria do **decode** e não a do prefill.
         // O que decide a ocupância é `ROWS_PER_WAVE * COLS` acumuladores vivos por lane, e
         // com duas colunas isso fica perto do decode (COLS=1) e longe das oito do bloco de
@@ -1542,6 +1559,7 @@ impl<'ctx> ResidentForward<'ctx> {
             mul_mm_q4k,
             mul_mm_q5k,
             mul_mm_q6k,
+            mul_mm_q3k,
             matvec_v,
             matvec_q5k_v,
             matvec_q6k_v,
@@ -3879,6 +3897,7 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::MulMmQ4K => &self.mul_mm_q4k,
             PipeId::MulMmQ5K => &self.mul_mm_q5k,
             PipeId::MulMmQ6K => &self.mul_mm_q6k,
+            PipeId::MulMmQ3K => &self.mul_mm_q3k,
             PipeId::MatvecV => &self.matvec_v,
             PipeId::MatvecQ5KV => &self.matvec_q5k_v,
             PipeId::MatvecQ6KV => &self.matvec_q6k_v,
@@ -4158,6 +4177,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 let gemm = match w.ty {
                     gguf::GgmlType::Q5_K => PipeId::MulMmQ5K,
                     gguf::GgmlType::Q6_K => PipeId::MulMmQ6K,
+                    gguf::GgmlType::Q3_K => PipeId::MulMmQ3K,
                     _ => PipeId::MulMmQ4K,
                 };
                 (gemm, GEMM_LINHAS_POR_WG as usize)
@@ -4710,8 +4730,7 @@ impl<'ctx> ResidentForward<'ctx> {
                     (dst.buffer, 0, ((n_out * slots) * 4) as vk::DeviceSize),
                     (mb.ids.buffer, 0, ((slots) * 4) as vk::DeviceSize),
                 ],
-                // 4 waves × 2 linhas por workgroup.
-                u32::try_from(n_out.div_ceil(8)).unwrap_or(u32::MAX),
+                u32::try_from(n_out.div_ceil(linhas_por_wg_moe(n_in))).unwrap_or(u32::MAX),
                 u32s(&[n_in, n_out, mc.n_usados, usize::from(x_por_slot)]),
             )?;
             Ok(Self::com_y(op, u32::try_from(slots).unwrap_or(1)))

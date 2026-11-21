@@ -58,15 +58,6 @@ int upack(uint qw, uint hw, uint sh_q, uint sh_h) {
     return int(((qw >> sh_q) & 0x03030303u) | (((hw >> sh_h) & 0x01010101u) << 2u));
 }
 
-int dot_meia(uvec4 q, uvec4 h, uint sh_q, uint sh_h, ivec4 x) {
-    int s = 0;
-    s = dotPacked4x8AccSatEXT(upack(q.x, h.x, sh_q, sh_h), x.x, s);
-    s = dotPacked4x8AccSatEXT(upack(q.y, h.y, sh_q, sh_h), x.y, s);
-    s = dotPacked4x8AccSatEXT(upack(q.z, h.z, sh_q, sh_h), x.z, s);
-    s = dotPacked4x8AccSatEXT(upack(q.w, h.w, sh_q, sh_h), x.w, s);
-    return s;
-}
-
 int soma4(ivec4 x) {
     int s = 0;
     s = dotPacked4x8AccSatEXT(0x01010101, x.x, s);
@@ -99,17 +90,16 @@ void main() {
         if (sb >= n_sb) { continue; }
         uint blk = sb * 8u + j;
 
-        ivec4 xa[COLS];
-        ivec4 xb[COLS];
+        // Só o que depende da coluna fica em registrador (as somas das duas metades e a
+        // escala); a ativação é relida dentro do laço, do L1 — guardar `xq` das COLS colunas
+        // custava ~350 VGPRs por lane no bloco de prefill e derrubava o kernel a 7 GB/s.
         int sxa[COLS];
         int sxb[COLS];
         float xdv[COLS];
         for (uint c = 0u; c < COLS; c++) {
             uint cb = c * n_blk + blk;
-            xa[c] = xq_buf.xq4[cb * 2u];
-            xb[c] = xq_buf.xq4[cb * 2u + 1u];
-            sxa[c] = soma4(xa[c]);
-            sxb[c] = soma4(xb[c]);
+            sxa[c] = soma4(xq_buf.xq4[cb * 2u]);
+            sxb[c] = soma4(xq_buf.xq4[cb * 2u + 1u]);
             xdv[c] = xd_buf.xd[cb];
         }
 
@@ -124,10 +114,31 @@ void main() {
             float d = unpackHalf2x16(sc.w).x;
             float s0 = d * float(escala(sc, 2u * j));
             float s1 = d * float(escala(sc, 2u * j + 1u));
+            // O peso é desempacotado uma vez por linha e usado pelas COLS colunas.
+            int w0 = upack(q0.x, h0.x, sh_q, sh_h);
+            int w1 = upack(q0.y, h0.y, sh_q, sh_h);
+            int w2 = upack(q0.z, h0.z, sh_q, sh_h);
+            int w3 = upack(q0.w, h0.w, sh_q, sh_h);
+            int w4_ = upack(q1.x, h1.x, sh_q, sh_h);
+            int w5 = upack(q1.y, h1.y, sh_q, sh_h);
+            int w6 = upack(q1.z, h1.z, sh_q, sh_h);
+            int w7 = upack(q1.w, h1.w, sh_q, sh_h);
             for (uint c = 0u; c < COLS; c++) {
-                int d0 = dot_meia(q0, h0, sh_q, sh_h, xa[c]) - 4 * sxa[c];
-                int d1 = dot_meia(q1, h1, sh_q, sh_h, xb[c]) - 4 * sxb[c];
-                acc[r * COLS + c] += xdv[c] * (s0 * float(d0) + s1 * float(d1));
+                uint cb = c * n_blk + blk;
+                ivec4 xa = xq_buf.xq4[cb * 2u];
+                ivec4 xb = xq_buf.xq4[cb * 2u + 1u];
+                int d0 = 0;
+                d0 = dotPacked4x8AccSatEXT(w0, xa.x, d0);
+                d0 = dotPacked4x8AccSatEXT(w1, xa.y, d0);
+                d0 = dotPacked4x8AccSatEXT(w2, xa.z, d0);
+                d0 = dotPacked4x8AccSatEXT(w3, xa.w, d0);
+                int d1 = 0;
+                d1 = dotPacked4x8AccSatEXT(w4_, xb.x, d1);
+                d1 = dotPacked4x8AccSatEXT(w5, xb.y, d1);
+                d1 = dotPacked4x8AccSatEXT(w6, xb.z, d1);
+                d1 = dotPacked4x8AccSatEXT(w7, xb.w, d1);
+                acc[r * COLS + c] +=
+                    xdv[c] * (s0 * float(d0 - 4 * sxa[c]) + s1 * float(d1 - 4 * sxb[c]));
             }
         }
     }

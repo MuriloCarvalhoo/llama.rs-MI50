@@ -80,7 +80,7 @@ fn com_gpu(
 #[test]
 fn q3_k_matvec_bate_com_a_cpu() {
     com_gpu(|ctx, phys, dev| {
-        for (n_in, cols) in [(512usize, 1usize), (2048, 1), (4096, 4)] {
+        for (n_in, cols) in [(512usize, 1usize), (2048, 1), (4096, 4), (2048, 32)] {
             let n_out = 24;
             let w = pesos(GgmlType::Q3_K, n_out * n_in / 256);
             let x = ativ(n_in * cols, 1);
@@ -140,4 +140,31 @@ fn moe_q3_k_bate_com_a_cpu() {
 fn moe_iq3_xxs_bate_com_a_cpu() {
     moe_caso(GgmlType::IQ3_XXS, false);
     moe_caso(GgmlType::IQ3_XXS, true);
+}
+
+/// O GEMM do prefill (`mul_mm.comp`, `TIPO = 3`) contra a CPU, nas larguras do bloco.
+#[test]
+fn gemm_q3_k_bate_com_a_cpu() {
+    com_gpu(|ctx, phys, dev| {
+        for (n_in, n_out, cols) in [(2048usize, 200usize, 32usize), (4096, 128, 8)] {
+            let w = pesos(GgmlType::Q3_K, n_out * n_in / 256);
+            let x = ativ(n_in * cols, 5);
+            let gpu = llama_vulkan::matmul::dispatch_mul_mm_q3k(
+                ctx, phys, dev, &w, &x, n_in, n_out, cols,
+            )
+            .unwrap();
+            for c in 0..cols {
+                let cpu = cpu_matvec(
+                    GgmlType::Q3_K,
+                    &w,
+                    &x[c * n_in..(c + 1) * n_in],
+                    n_in,
+                    n_out,
+                );
+                let e = erro_rel(&gpu[c * n_out..(c + 1) * n_out], &cpu);
+                assert!(e < 1e-5, "GEMM Q3_K n_in={n_in} col={c} divergiu: {e}");
+            }
+            eprintln!("GEMM Q3_K n_in={n_in} cols={cols}: ok");
+        }
+    });
 }

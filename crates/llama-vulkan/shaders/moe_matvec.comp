@@ -1,6 +1,7 @@
 #version 450
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
 #extension GL_EXT_integer_dot_product : require
 
 // Matvec dos experts de um MoE: cada slot (token, k) multiplica a ativação pela matriz do
@@ -25,6 +26,12 @@
 //   entra sem desempacotar: dot(g ⊙ ±1, x) = dot(g, x) - 2 * dot(g & neg, x), com `neg` com
 //   0xFF nos bytes negativos. O 8º bit de sinal é a paridade dos 7 — o `ksigns_iq2xs` do
 //   llama.cpp, calculado. Mesma ordem de `dequantize_row_iq3_xxs`.
+//
+// Geometria: a lane `j = lane & 7` cobre um sub-bloco de 32 e o grupo `g = lane >> 3` um
+// superbloco. Com menos de 8 superblocos por linha (o `down`, n_in = 512, tem 2), os grupos
+// que sobrariam parados pegam outras linhas: `R = 8 / n_sb` linhas por passada, cada uma
+// num cluster contíguo de `8 * n_sb` lanes, reduzido com `subgroupClusteredAdd`. O host
+// despacha `n_out / (8 * R)` workgroups — ver `linhas_por_wg_moe`.
 
 layout(local_size_x = 256) in;
 layout(constant_id = 0) const uint TIPO = 0u;
@@ -146,20 +153,25 @@ void main() {
         barrier();
     }
     uint lane = gl_SubgroupInvocationID;
-    uint row = (gl_WorkGroupID.x * WAVES_PER_WG + gl_SubgroupID) * ROWS_PER_WAVE;
-    if (row >= pc.n_out) { return; }
+    uint n_sb = pc.n_in / 256u;
+    // Linhas por passada (n_sb é potência de 2: 2 no down, 8 no gate/up).
+    uint rr = n_sb >= 8u ? 1u : 8u / n_sb;
+    uint row0 = (gl_WorkGroupID.x * WAVES_PER_WG + gl_SubgroupID) * ROWS_PER_WAVE * rr;
+    if (row0 >= pc.n_out) { return; }
+    uint g = lane >> 3u;
+    // Linha deste grupo dentro da passada e o primeiro superbloco que ele lê.
+    uint row_off = rr > 1u ? g / n_sb : 0u;
+    uint sb_ini = rr > 1u ? g % n_sb : g;
 
     uint slot = gl_WorkGroupID.y;
     uint expert = ids_buf.ids[slot];
     uint col = pc.x_por_slot != 0u ? slot : slot / pc.n_usados;
 
-    uint n_sb = pc.n_in / 256u;
     uint linha4 = n_sb * UVEC4_PER_SB;
     uint n_blk = pc.n_in / 32u;
     uint base_exp = expert * pc.n_out * linha4;
 
     uint j = lane & 7u;
-    uint sb_in_grp = lane >> 3u;
     uint n = j >> 2u;
     uint sh_q = 2u * (j & 3u);
     uint sh_h = 4u * n + (j & 3u);
@@ -167,17 +179,16 @@ void main() {
     float acc[ROWS_PER_WAVE];
     for (uint r = 0u; r < ROWS_PER_WAVE; r++) { acc[r] = 0.0; }
 
-    for (uint sb0 = 0u; sb0 < n_sb; sb0 += 8u) {
-        uint sb = sb0 + sb_in_grp;
-        if (sb >= n_sb) { continue; }
+    for (uint sb = sb_ini; sb < n_sb; sb += 8u) {
         uint cb = col * n_blk + sb * 8u + j;
         ivec4 xa = xq_buf.xq4[cb * 2u];
         ivec4 xb = xq_buf.xq4[cb * 2u + 1u];
         float xdv = xd_buf.xd[cb];
 
         for (uint r = 0u; r < ROWS_PER_WAVE; r++) {
-            if (row + r >= pc.n_out) { continue; }
-            uint b4 = base_exp + (row + r) * linha4 + sb * UVEC4_PER_SB;
+            uint row = row0 + r * rr + row_off;
+            if (row >= pc.n_out) { continue; }
+            uint b4 = base_exp + row * linha4 + sb * UVEC4_PER_SB;
             if (TIPO == 0u) {
                 uvec4 h0 = weight_buf.w4[b4];
                 uvec4 h1 = weight_buf.w4[b4 + 1u];
@@ -213,10 +224,23 @@ void main() {
         }
     }
 
+    // Cada linha da passada é a soma do seu cluster de 8 * n_sb lanes (a wave inteira
+    // quando rr = 1). O tamanho do cluster tem de ser constante: um ramo por caso.
+    uint cluster = rr > 1u ? 8u * n_sb : 64u;
     for (uint r = 0u; r < ROWS_PER_WAVE; r++) {
-        float s = subgroupAdd(acc[r]);
-        if (lane == 0u && row + r < pc.n_out) {
-            out_buf.y[slot * pc.n_out + row + r] = s;
+        float s;
+        if (rr == 1u) {
+            s = subgroupAdd(acc[r]);
+        } else if (n_sb == 4u) {
+            s = subgroupClusteredAdd(acc[r], 32u);
+        } else if (n_sb == 2u) {
+            s = subgroupClusteredAdd(acc[r], 16u);
+        } else {
+            s = subgroupClusteredAdd(acc[r], 8u);
+        }
+        uint row = row0 + r * rr + row_off;
+        if ((lane & (cluster - 1u)) == 0u && row < pc.n_out) {
+            out_buf.y[slot * pc.n_out + row] = s;
         }
     }
 }
