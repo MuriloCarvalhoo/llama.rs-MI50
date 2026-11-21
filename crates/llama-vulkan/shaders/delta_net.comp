@@ -1,6 +1,7 @@
 #version 450
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
 #extension GL_EXT_control_flow_attributes : require
 
 // A recorrencia do gated delta net (arquiteturas hibridas tipo qwen35) sobre um bloco de
@@ -18,10 +19,14 @@
 //   M[col] = exp(g[t]) * M[col] + k[t] * delta   // decaimento e posto 1, fundidos
 //   out[t] = sum_i M[col][i] * q[t][i] / sqrt(d)
 //
-// **Uma wave por coluna, com o estado em registrador.** Cada lane guarda `d / 64`
-// elementos da coluna, entao as 64 lanes cobrem a coluna inteira e os dois produtos
-// internos viram `subgroupAdd`. Lanes vizinhas leem posicoes vizinhas da coluna — acesso
-// coalescido.
+// **`LANES` = 8 lanes por coluna, com o estado em registrador**, como o llama.cpp faz com
+// S_V >= 128. Cada lane guarda `D / LANES` = 16 elementos da coluna e os dois produtos
+// internos viram `subgroupClusteredAdd`. Com uma wave inteira por coluna (o desenho
+// anterior) cada lane guardava 2 elementos e cada token pagava duas reducoes de 64 lanes;
+// a recorrencia e serial, entao o que manda e a latencia por token. Medido no 35B (GPU0,
+// 19 camadas, bloco de 256): 64 lanes 18,2 ms, 16 lanes 6,9, 8 lanes 6,4. No decode
+// (n_tok = 1, limitado por banda) 16 lanes ganham: 0,18 contra 0,23 ms por token, porque
+// com 8 so ha 512 waves para ler o estado. Lanes vizinhas leem posicoes vizinhas.
 //
 // **O laco sobre os tokens do bloco mora aqui dentro**, e e o que torna o prefill em batch
 // viavel: a recorrencia e serial por construcao (o token t depende do estado depois de
@@ -31,12 +36,17 @@
 // camada, com uma barreira de pipeline entre cada par. `n_tok = 1` reproduz exatamente o
 // decode. O desenho segue `gated_delta_net.comp` do backend Vulkan do llama.cpp.
 //
-// Os lacos sobre `por_lane` sao limitados por `MAX_POR_LANE` (compile-time) com guarda de
-// runtime: o indice de `s_reg`/`k_reg`/`q_reg` precisa ser constante depois do unroll para
-// os arrays ficarem em VGPR. Com o limite de runtime direto eles iriam para scratch — e
-// scratch e memoria global, que e justamente o que este desenho existe para evitar.
+// **`D` e constante de compilacao**, como o S_V do llama.cpp: o indice de
+// `s_reg`/`k_reg`/`q_reg` precisa ser constante depois do unroll para os arrays ficarem em
+// VGPR, e com o limite de runtime guardado por `if` cada `if` esperava a sua carga (as
+// leituras de k e q viravam idas e voltas em serie) — ~4x mais lento com 8 lanes. Sem
+// guarda nenhuma ainda e ~15% mais rapido que guardas sem desvio. O plano recusa d != D.
 
-layout(local_size_x = 64, local_size_y = 4) in;  // 4 colunas por workgroup, uma wave cada
+const uint D = 128u;            // d_state do Qwen3.8 (27B e 35B-A3B)
+const uint LANES = 8u;         // lanes por coluna; literal porque o cluster e constante
+const uint POR_LANE = D / LANES;
+const uint COLS_POR_WG = 32u;   // o dispatch do Rust divide `n_heads * D` por isto
+layout(local_size_x = 256) in;  // COLS_POR_WG * LANES
 
 layout(set = 0, binding = 0) buffer StateBuf { float s[]; } state_buf;   // inout [n_heads][d][d]
 layout(set = 0, binding = 1) readonly buffer QBuf { float q[]; } q_buf;  // [n_tok][n_k_heads][d]
@@ -47,7 +57,7 @@ layout(set = 0, binding = 4) readonly buffer GBuf { vec2 gb[]; } g_buf;  // [n_t
 layout(set = 0, binding = 5) writeonly buffer OutBuf { float o[]; } out_buf; // [n_tok][n_heads][d]
 
 layout(push_constant) uniform PC {
-    uint d;        // dimensao da cabeca (= d_state); multiplo de 64
+    uint d;        // dimensao da cabeca (= d_state); o shader usa `D`, o plano garante d == D
     uint n_heads;  // cabecas de valor
     uint rep;      // cabecas de valor por cabeca de chave (GQA): 3 no Qwen3.8
     uint n_tok;    // tokens do bloco processados neste dispatch (1 no decode)
@@ -57,21 +67,17 @@ layout(push_constant) uniform PC {
     uint v_stride;
 } pc;
 
-const uint LANES = 64u;
-const uint MAX_POR_LANE = 4u;   // cobre d ate 256
-
 void main() {
-    // Workgroups linearizados em x: `d / local_size_y` por cabeca. O dispatch do plano
+    // Workgroups linearizados em x: `D / COLS_POR_WG` por cabeca. O dispatch do plano
     // so varia a dimensao x, entao a divisao acontece aqui.
-    uint wg_por_head = pc.d / gl_WorkGroupSize.y;
+    const uint wg_por_head = D / COLS_POR_WG;
     uint h = gl_WorkGroupID.x / wg_por_head;
-    uint col = (gl_WorkGroupID.x % wg_por_head) * gl_WorkGroupSize.y + gl_LocalInvocationID.y;
-    uint lane = gl_LocalInvocationID.x;
-    // `h` e `col` nao dependem de `lane`: o return e uniforme na wave, entao os
-    // `subgroupAdd` do laco abaixo nunca ficam em fluxo divergente.
-    if (h >= pc.n_heads || col >= pc.d) { return; }
+    uint col = (gl_WorkGroupID.x % wg_por_head) * COLS_POR_WG + gl_LocalInvocationID.x / LANES;
+    uint lane = gl_LocalInvocationID.x % LANES;
+    // `h` e `col` sao uniformes no cluster (64 % LANES == 0, entao ele nao cruza waves):
+    // o return nunca deixa um cluster pela metade.
+    if (h >= pc.n_heads) { return; }
 
-    uint por_lane = pc.d / LANES;
     // q e k tem menos cabecas que v (GQA): o llama.cpp expande de num_k_heads para
     // num_v_heads com `ggml_repeat`, cuja semantica e MODULO (`dest[i] = src[i %
     // ne_src]`), nao blocos — confirmado em ggml_compute_forward_repeat_f32
@@ -80,16 +86,16 @@ void main() {
     // (entrelacado: h=0,1,2,3,4,5 -> chave 0,1,0,1,0,1 quando n_k_heads=2), NAO `h / rep`
     // (blocos: 0,0,0,1,1,1). Indexar aqui evita materializar a repeticao num buffer.
     uint n_k_heads = pc.n_heads / pc.rep;
-    uint qk_stride = n_k_heads * pc.d;   // passo entre tokens em q e k
-    uint out_stride = pc.n_heads * pc.d; // idem em out
-    uint base_qk = (h % n_k_heads) * pc.d;
-    uint base_h = h * pc.d;
-    uint base_col = h * pc.d * pc.d + col * pc.d;
+    uint qk_stride = n_k_heads * D;   // passo entre tokens em q e k
+    uint out_stride = pc.n_heads * D; // idem em out
+    uint base_qk = (h % n_k_heads) * D;
+    uint base_h = h * D;
+    uint base_col = h * D * D + col * D;
 
     // O estado entra em registrador uma vez e so volta a memoria depois do ultimo token.
-    float s_reg[MAX_POR_LANE];
-    [[unroll]] for (uint r = 0u; r < MAX_POR_LANE; r++) {
-        if (r < por_lane) { s_reg[r] = state_buf.s[base_col + r * LANES + lane]; }
+    float s_reg[POR_LANE];
+    [[unroll]] for (uint r = 0u; r < POR_LANE; r++) {
+        s_reg[r] = state_buf.s[base_col + r * LANES + lane];
     }
 
     for (uint t = 0u; t < pc.n_tok; t++) {
@@ -97,38 +103,34 @@ void main() {
         float decay = exp(gb.x);
         float beta = gb.y;
 
-        float k_reg[MAX_POR_LANE];
-        float q_reg[MAX_POR_LANE];
+        float k_reg[POR_LANE];
+        float q_reg[POR_LANE];
         float kv = 0.0;
-        [[unroll]] for (uint r = 0u; r < MAX_POR_LANE; r++) {
-            if (r < por_lane) {
-                uint i = t * qk_stride + base_qk + r * LANES + lane;
-                k_reg[r] = k_buf.k[i];
-                q_reg[r] = q_buf.q[i];
-                kv += s_reg[r] * k_reg[r];
-            }
+        [[unroll]] for (uint r = 0u; r < POR_LANE; r++) {
+            uint i = t * qk_stride + base_qk + r * LANES + lane;
+            k_reg[r] = k_buf.k[i];
+            q_reg[r] = q_buf.q[i];
+            kv += s_reg[r] * k_reg[r];
         }
-        kv = subgroupAdd(kv);
+        kv = subgroupClusteredAdd(kv, LANES);
 
-        // `kv` sai uniforme na wave; o decaimento entra aqui em vez de numa passada propria
+        // `kv` sai uniforme no cluster; o decaimento entra aqui em vez de numa passada propria
         // sobre o estado, porque `dot(decay * M[col], k) == decay * dot(M[col], k)`.
         float delta = (v_buf.v[t * pc.v_stride + base_h + col] - decay * kv) * beta;
 
         float acc = 0.0;
-        [[unroll]] for (uint r = 0u; r < MAX_POR_LANE; r++) {
-            if (r < por_lane) {
-                s_reg[r] = decay * s_reg[r] + k_reg[r] * delta;
-                acc += s_reg[r] * q_reg[r];
-            }
+        [[unroll]] for (uint r = 0u; r < POR_LANE; r++) {
+            s_reg[r] = decay * s_reg[r] + k_reg[r] * delta;
+            acc += s_reg[r] * q_reg[r];
         }
-        acc = subgroupAdd(acc);
+        acc = subgroupClusteredAdd(acc, LANES);
 
         if (lane == 0u) {
-            out_buf.o[t * out_stride + base_h + col] = acc * inversesqrt(float(pc.d));
+            out_buf.o[t * out_stride + base_h + col] = acc * inversesqrt(float(D));
         }
     }
 
-    [[unroll]] for (uint r = 0u; r < MAX_POR_LANE; r++) {
-        if (r < por_lane) { state_buf.s[base_col + r * LANES + lane] = s_reg[r]; }
+    [[unroll]] for (uint r = 0u; r < POR_LANE; r++) {
+        state_buf.s[base_col + r * LANES + lane] = s_reg[r];
     }
 }

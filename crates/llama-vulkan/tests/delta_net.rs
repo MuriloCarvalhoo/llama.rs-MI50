@@ -110,8 +110,8 @@ fn delta_net_bate_com_a_referencia_de_cpu() {
                 vec![0f32; n_heads * d],
             ],
             &push,
-            // n_heads * (d / 4): quatro colunas do estado por workgroup.
-            (n_heads * d / 4) as u32,
+            // n_heads * (d / 32): 32 colunas do estado por workgroup (`COLS_POR_WG`).
+            (n_heads * d / 32) as u32,
         )
         .expect("dispatch delta_net");
     let estado_gpu = &saida[0];
@@ -152,7 +152,7 @@ fn delta_net_gqa_mapeia_cabeca_de_valor_para_chave_por_modulo() {
     let Some((ctx, ())) = ctx_fwd() else { return };
     let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
 
-    let d = 64usize;
+    let d = 128usize; // o shader tem d fixo (`D`)
     let n_k_heads = 2usize;
     let rep = 3usize;
     let n_heads = n_k_heads * rep; // 6 cabeças de valor, como no teste acima
@@ -187,7 +187,7 @@ fn delta_net_gqa_mapeia_cabeca_de_valor_para_chave_por_modulo() {
                 vec![0f32; n_heads * d],
             ],
             &push,
-            (n_heads * d / 4) as u32,
+            (n_heads * d / 32) as u32,
         )
         .expect("dispatch delta_net (GQA)");
     let estado_gpu = &saida[0];
@@ -285,7 +285,7 @@ fn delta_net_em_bloco_bate_com_a_referencia_token_a_token() {
                 vec![0f32; n_tok * value_dim],
             ],
             &push,
-            (n_heads * d / 4) as u32,
+            (n_heads * d / 32) as u32,
         )
         .expect("dispatch delta_net (bloco)");
     let estado_gpu = &saida[0];

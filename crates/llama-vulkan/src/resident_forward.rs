@@ -2775,6 +2775,10 @@ impl<'ctx> ResidentForward<'ctx> {
         if dn_cfg.d_conv > 5 {
             return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
         }
+        // O `delta_net.comp` tem d = 128 em tempo de compilação (`D`), como o S_V do llama.cpp.
+        if dn_cfg.d_state != 128 {
+            return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+        }
 
         let key_dim = dn_cfg.d_state * dn_cfg.n_k_heads;
         let value_dim = dn_cfg.head_v_dim() * dn_cfg.n_v_heads;
@@ -2896,7 +2900,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 (b.gb.buffer, 0, nbt(dn_cfg.n_v_heads * 2)),
                 (b.out.buffer, 0, nbt(value_dim)),
             ],
-            u32::try_from(dn_cfg.n_v_heads * dn_cfg.d_state / 4).unwrap_or(u32::MAX),
+            u32::try_from(dn_cfg.n_v_heads * dn_cfg.d_state / 32).unwrap_or(u32::MAX),
             PushSpec::Static({
                 let mut v = push3(
                     u32::try_from(dn_cfg.d_state).unwrap_or(u32::MAX),
@@ -3095,7 +3099,7 @@ impl<'ctx> ResidentForward<'ctx> {
                     ),
                     (b.out.buffer, nb(t * value_dim), nb(value_dim)),
                 ],
-                u(dn_cfg.n_v_heads * dn_cfg.d_state / 4),
+                u(dn_cfg.n_v_heads * dn_cfg.d_state / 32),
                 PushSpec::Static({
                     let mut v = push3(
                         u(dn_cfg.d_state),

@@ -127,7 +127,7 @@ fn snapshot_do_estado_desfaz_exatamente_um_token() {
         n_tok: 1,
         v_stride: (n_heads * d) as u32,
     });
-    let groups = (n_heads * d / 4) as u32;
+    let groups = (n_heads * d / 32) as u32;
     // Três tokens diferentes: um token repetido esconderia um estado que não avançou.
     let tok = |s: usize| {
         (
