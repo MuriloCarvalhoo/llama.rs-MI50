@@ -6,9 +6,18 @@
 //
 // W é o `ffn_gate_inp` ([n_expert][n_in]) com o `ffn_gate_inp_shexp` ([n_in]) anexado como
 // última linha — o truque do Strata: o gate do expert compartilhado sai do mesmo dispatch.
-// x é a saída f32 da norma do FFN (`b_normed`). Uma wave por linha, um token por grid Y.
+// x é a saída f32 da norma do FFN (`b_normed`).
+//
+// Uma wave por linha, com a linha inteira em registrador (n_in / 64 floats por lane), e
+// TOK_POR_WG tokens do bloco por workgroup (grid Y): o peso sai da memória uma vez para
+// cada TOK_POR_WG tokens, e não uma vez por token (eram 2,1 MB relidos por token e camada
+// no bloco de 256). Com o bloco inteiro num workgroup sobravam 65 workgroups em série pelos
+// 256 tokens — ficou 2× mais lento.
 
 layout(local_size_x = 256) in;
+// Teto de n_in / 256 (vec4 por lane): 8 cobre n_in até 2048.
+const uint MAX_VEC4 = 8u;
+const uint TOK_POR_WG = 8u;
 
 layout(set = 0, binding = 0) readonly buffer WeightBuf { vec4 w[]; } weight_buf;
 layout(set = 0, binding = 1) readonly buffer XBuf { vec4 x[]; } x_buf;
@@ -17,20 +26,28 @@ layout(set = 0, binding = 2) writeonly buffer OutBuf { float l[]; } out_buf;
 layout(push_constant) uniform PC {
     uint n_in;
     uint n_linhas;
+    uint n_tok;
 } pc;
 
 void main() {
     uint lane = gl_SubgroupInvocationID;
     uint linha = gl_WorkGroupID.x * 4u + gl_SubgroupID;
     if (linha >= pc.n_linhas) { return; }
-    uint t = gl_WorkGroupID.y;
     uint n4 = pc.n_in / 4u;
-    float acc = 0.0;
-    for (uint i = lane; i < n4; i += 64u) {
-        acc += dot(weight_buf.w[linha * n4 + i], x_buf.x[t * n4 + i]);
+    uint por_lane = n4 / 64u;
+    vec4 wr[MAX_VEC4];
+    for (uint k = 0u; k < por_lane; k++) {
+        wr[k] = weight_buf.w[linha * n4 + lane + 64u * k];
     }
-    float s = subgroupAdd(acc);
-    if (lane == 0u) {
-        out_buf.l[t * pc.n_linhas + linha] = s;
+    uint t0 = gl_WorkGroupID.y * TOK_POR_WG;
+    for (uint t = t0; t < min(t0 + TOK_POR_WG, pc.n_tok); t++) {
+        float acc = 0.0;
+        for (uint k = 0u; k < por_lane; k++) {
+            acc += dot(wr[k], x_buf.x[t * n4 + lane + 64u * k]);
+        }
+        float s = subgroupAdd(acc);
+        if (lane == 0u) {
+            out_buf.l[t * pc.n_linhas + linha] = s;
+        }
     }
 }

@@ -661,6 +661,91 @@ pub fn dispatch_mul_mm_q3k(
     )
 }
 
+/// GEMM Q8_0 (`mul_mm.comp` com `TIPO = 4`), com os blocos de 34 bytes reempacotados em 36.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_mul_mm_q8_0(
+    ctx: &VulkanContext,
+    phys: &VulkanPhysicalDevice,
+    dev: &VulkanDevice,
+    w_bytes: &[u8],
+    x_f32: &[f32],
+    n_in: usize,
+    n_out: usize,
+    cols: usize,
+) -> Result<Vec<f32>, MatmulError> {
+    if !crate::resident_forward::gemm_largura_ok(cols) {
+        return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+    }
+    let mut alinhado = vec![0u8; w_bytes.len() / 34 * 36];
+    crate::tensor::repack_q8_0_into(w_bytes, &mut alinhado);
+    let cols_u32 =
+        u32::try_from(cols).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?;
+    dispatch_k_matvec(
+        ctx,
+        phys,
+        dev,
+        crate::MUL_MM_SPV,
+        &alinhado,
+        x_f32,
+        n_in,
+        n_out,
+        cols,
+        crate::resident_forward::GEMM_LINHAS_POR_WG,
+        &[(0, cols_u32), (1, 4)],
+    )
+}
+
+/// GEMM dos experts (`mul_mm.comp` com `MOE = 1`) com um mapa de tiles pronto — o que o
+/// `moe_contar.comp` monta na GPU. `w_bytes` é o tensor 3D como está no GGUF.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_moe_gemm(
+    ctx: &VulkanContext,
+    phys: &VulkanPhysicalDevice,
+    dev: &VulkanDevice,
+    ty: gguf::GgmlType,
+    w_bytes: &[u8],
+    x_f32: &[f32],
+    mapa: &[u32],
+    max_tiles: usize,
+    n_slots: usize,
+    n_in: usize,
+    n_out: usize,
+    n_usados: usize,
+    x_por_slot: bool,
+) -> Result<Vec<f32>, MatmulError> {
+    let (tipo, bloco) = match ty {
+        gguf::GgmlType::Q3_K => (3, 110),
+        gguf::GgmlType::IQ3_XXS => (5, 98),
+        _ => return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT)),
+    };
+    let mut alinhado = vec![0u8; w_bytes.len() / bloco * 112];
+    if tipo == 3 {
+        crate::tensor::pad_q3_k_into(w_bytes, &mut alinhado);
+    } else {
+        crate::tensor::repack_iq3_xxs_into(w_bytes, &mut alinhado);
+    }
+    let u = |v: usize| u32::try_from(v).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN));
+    dispatch_k_matvec_ext(
+        ctx,
+        phys,
+        dev,
+        crate::MUL_MM_SPV,
+        &alinhado,
+        x_f32,
+        n_in,
+        n_out,
+        x_f32.len() / n_in,
+        crate::resident_forward::GEMM_LINHAS_POR_WG,
+        &[(0, u(crate::resident_forward::MOE_BN)?), (1, tipo), (2, 1)],
+        &Extra {
+            ids: Some(mapa),
+            push23: [u(n_usados)?, u32::from(x_por_slot)],
+            groups_y: Some(u(max_tiles)?),
+            saida_floats: n_slots * n_out,
+        },
+    )
+}
+
 /// Caminho comum dos matvecs K-quant: sobe pesos e ativação, despacha
 /// `n_out / rows_por_wg` workgroups e lê o resultado. `w_bytes` já vem no layout que o
 /// shader espera.

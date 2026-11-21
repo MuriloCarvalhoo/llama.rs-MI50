@@ -1,0 +1,77 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+// Agrupa os slots (token, k) do bloco de prefill por expert, para o GEMM dos experts
+// (`mul_mm.comp` com `MOE = 1`) ler o peso de cada expert uma vez para todos os tokens que o
+// escolheram — o `count_experts.comp` do llama.cpp, num workgroup só.
+//
+// Saída em `mapa` (uints):
+//   [0]              número de tiles
+//   [1]              onde começa a lista de slots (= 2 + 3 * max_tiles)
+//   [2 + 3t .. +2]   tile t: expert, início na lista, quantos slots (até BN)
+//   [mapa[1] + i]    os slots agrupados por expert
+//
+// Um thread por expert (n_expert ≤ 256). A ordem dos slots dentro de um expert sai dos
+// atômicos e não é fixa, mas cada slot é uma coluna independente do GEMM: o resultado de
+// cada um não muda com a posição.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer IdsBuf { uint ids[]; } ids_buf;
+layout(set = 0, binding = 1) writeonly buffer MapaBuf { uint m[]; } mapa;
+
+layout(push_constant) uniform PC {
+    uint n_slots;
+    uint n_expert;
+    uint bn;         // colunas por tile do GEMM
+    uint max_tiles;  // n_expert + n_slots / bn, arredondado — o host dimensiona igual
+} pc;
+
+shared uint cont[256];
+shared uint cursor[256];
+shared uint soma_wave[4];
+shared uint tiles_wave[4];
+
+void main() {
+    uint e = gl_LocalInvocationID.x;
+    cont[e] = 0u;
+    barrier();
+    for (uint i = e; i < pc.n_slots; i += 256u) {
+        atomicAdd(cont[ids_buf.ids[i]], 1u);
+    }
+    barrier();
+
+    uint c = e < pc.n_expert ? cont[e] : 0u;
+    uint nt = (c + pc.bn - 1u) / pc.bn;
+    // Prefixo exclusivo de slots e de tiles pelos 256 experts: na wave e entre as 4 waves.
+    uint ps = subgroupExclusiveAdd(c);
+    uint pt = subgroupExclusiveAdd(nt);
+    uint w = gl_SubgroupID;
+    if (gl_SubgroupInvocationID == 63u) {
+        soma_wave[w] = ps + c;
+        tiles_wave[w] = pt + nt;
+    }
+    barrier();
+    for (uint k = 0u; k < w; k++) {
+        ps += soma_wave[k];
+        pt += tiles_wave[k];
+    }
+    uint off = 2u + 3u * pc.max_tiles;
+    for (uint t = 0u; t < nt; t++) {
+        uint d = 2u + 3u * (pt + t);
+        mapa.m[d] = e;
+        mapa.m[d + 1u] = ps + t * pc.bn;
+        mapa.m[d + 2u] = min(pc.bn, c - t * pc.bn);
+    }
+    if (e == 255u) {
+        mapa.m[0] = pt + nt;
+        mapa.m[1] = off;
+    }
+    cursor[e] = ps;
+    barrier();
+    for (uint i = e; i < pc.n_slots; i += 256u) {
+        uint pos = atomicAdd(cursor[ids_buf.ids[i]], 1u);
+        mapa.m[off + pos] = i;
+    }
+}

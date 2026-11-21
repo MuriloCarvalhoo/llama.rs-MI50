@@ -42,7 +42,7 @@ fn ativ(n: usize, semente: usize) -> Vec<f32> {
 }
 
 fn cpu_matvec(ty: GgmlType, w: &[u8], x: &[f32], n_in: usize, n_out: usize) -> Vec<f32> {
-    let row = n_in / 256 * ty.type_size() as usize;
+    let row = n_in / ty.block_size() as usize * ty.type_size() as usize;
     let xq = quant_dequant_x(x);
     (0..n_out)
         .map(|r| {
@@ -167,4 +167,117 @@ fn gemm_q3_k_bate_com_a_cpu() {
             eprintln!("GEMM Q3_K n_in={n_in} cols={cols}: ok");
         }
     });
+}
+
+/// O GEMM Q8_0 (`TIPO = 4`), que só entra acima de 32 colunas (o `attn_gate` no bloco de 256).
+#[test]
+fn gemm_q8_0_bate_com_a_cpu() {
+    com_gpu(|ctx, phys, dev| {
+        for (n_in, n_out, cols) in [(2048usize, 136usize, 64usize), (2048, 64, 256)] {
+            let w = pesos(GgmlType::Q8_0, n_out * n_in / 32);
+            let x = ativ(n_in * cols, 7);
+            let gpu = llama_vulkan::matmul::dispatch_mul_mm_q8_0(
+                ctx, phys, dev, &w, &x, n_in, n_out, cols,
+            )
+            .unwrap();
+            for c in 0..cols {
+                let cpu = cpu_matvec(
+                    GgmlType::Q8_0,
+                    &w,
+                    &x[c * n_in..(c + 1) * n_in],
+                    n_in,
+                    n_out,
+                );
+                let e = erro_rel(&gpu[c * n_out..(c + 1) * n_out], &cpu);
+                assert!(e < 1e-5, "GEMM Q8_0 cols={cols} col={c} divergiu: {e}");
+            }
+            eprintln!("GEMM Q8_0 cols={cols}: ok");
+        }
+    });
+}
+
+/// Mapa de tiles como o `moe_contar.comp` monta: slots agrupados por expert, tiles de até
+/// `bn` slots. Devolve (mapa, max_tiles).
+fn mapa_de(ids: &[u32], n_expert: usize, bn: usize) -> (Vec<u32>, usize) {
+    let max_tiles = n_expert + ids.len().div_ceil(bn);
+    let off = 2 + 3 * max_tiles;
+    let mut m = vec![0u32; off + ids.len()];
+    let (mut n_tiles, mut pos) = (0usize, 0usize);
+    for e in 0..n_expert as u32 {
+        let slots: Vec<usize> = (0..ids.len()).filter(|&i| ids[i] == e).collect();
+        for (t, pedaco) in slots.chunks(bn).enumerate() {
+            let d = 2 + 3 * n_tiles;
+            m[d] = e;
+            m[d + 1] = (pos + t * bn) as u32;
+            m[d + 2] = pedaco.len() as u32;
+            n_tiles += 1;
+        }
+        for (k, &s) in slots.iter().enumerate() {
+            m[off + pos + k] = s as u32;
+        }
+        pos += slots.len();
+    }
+    m[0] = n_tiles as u32;
+    m[1] = off as u32;
+    (m, max_tiles)
+}
+
+/// O GEMM dos experts no prefill (`mul_mm.comp`, `MOE = 1`): 40 tokens, 4 de 8 experts por
+/// token, com experts que recebem mais de 32 slots (dois tiles) e outros nenhum.
+fn moe_gemm_caso(ty: GgmlType, x_por_slot: bool) {
+    com_gpu(|ctx, phys, dev| {
+        let (n_expert, n_usados, n_tok) = (8usize, 4usize, 40usize);
+        let (n_in, n_out) = if x_por_slot { (512, 192) } else { (2048, 136) };
+        let w = pesos(ty, n_expert * n_out * n_in / 256);
+        // Experts 0 e 3 recebem quase todos os slots; 7 nenhum.
+        let ids: Vec<u32> = (0..n_tok * n_usados)
+            .map(|i| [0u32, 3, (i % 6) as u32, ((i * 5) % 7) as u32][i % 4])
+            .collect();
+        let n_cols = if x_por_slot { ids.len() } else { n_tok };
+        let x = ativ(n_in * n_cols, 11);
+        let (mapa, max_tiles) = mapa_de(&ids, n_expert, 32);
+        let gpu = llama_vulkan::matmul::dispatch_moe_gemm(
+            ctx,
+            phys,
+            dev,
+            ty,
+            &w,
+            &x,
+            &mapa,
+            max_tiles,
+            ids.len(),
+            n_in,
+            n_out,
+            n_usados,
+            x_por_slot,
+        )
+        .unwrap();
+        let por_expert = n_out * n_in / 256 * ty.type_size() as usize;
+        for (s, &e) in ids.iter().enumerate() {
+            let col = if x_por_slot { s } else { s / n_usados };
+            let we = &w[e as usize * por_expert..(e as usize + 1) * por_expert];
+            let cpu = cpu_matvec(ty, we, &x[col * n_in..(col + 1) * n_in], n_in, n_out);
+            let err = erro_rel(&gpu[s * n_out..(s + 1) * n_out], &cpu);
+            assert!(
+                err < 1e-5,
+                "{ty:?} GEMM MoE slot {s} (expert {e}) divergiu: {err}"
+            );
+        }
+        eprintln!(
+            "{ty:?} GEMM MoE x_por_slot={x_por_slot}: {} slots ok",
+            ids.len()
+        );
+    });
+}
+
+#[test]
+fn moe_gemm_q3_k_bate_com_a_cpu() {
+    moe_gemm_caso(GgmlType::Q3_K, false);
+    moe_gemm_caso(GgmlType::Q3_K, true);
+}
+
+#[test]
+fn moe_gemm_iq3_xxs_bate_com_a_cpu() {
+    moe_gemm_caso(GgmlType::IQ3_XXS, false);
+    moe_gemm_caso(GgmlType::IQ3_XXS, true);
 }

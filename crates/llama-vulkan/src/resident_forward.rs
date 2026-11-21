@@ -99,11 +99,17 @@ fn batch_do_modelo(raw: &GpuRawWeights) -> usize {
             .into_iter()
             .chain([l.ffn_gate.ty, l.ffn_up.ty, l.ffn_down.ty])
     });
+    // shortcut: o GEMM Q8_0 só foi medido no MoE (o `attn_gate` do Qwen3.8-35B-A3B); nos
+    // modelos densos em Q8_0 o bloco segue em 32 até alguém medir o 256 neles.
+    let moe = raw.layers.iter().any(|l| l.moe.is_some());
     let todos_gemm = tipos.into_iter().all(|t| {
         matches!(
             t,
-            gguf::GgmlType::Q4_K | gguf::GgmlType::Q5_K | gguf::GgmlType::Q6_K
-        )
+            gguf::GgmlType::Q3_K
+                | gguf::GgmlType::Q4_K
+                | gguf::GgmlType::Q5_K
+                | gguf::GgmlType::Q6_K
+        ) || (moe && t == gguf::GgmlType::Q8_0)
     });
     if gemm_prefill() && todos_gemm {
         256
@@ -111,6 +117,15 @@ fn batch_do_modelo(raw: &GpuRawWeights) -> usize {
         32
     }
 }
+
+/// Teto de tiles do GEMM dos experts (`moe_contar.comp`): no máximo um tile parcial por
+/// expert além dos cheios. O shader recebe o mesmo número pelo push.
+pub(crate) fn max_tiles_moe(n_expert: usize, n_slots: usize) -> usize {
+    n_expert + n_slots.div_ceil(MOE_BN)
+}
+
+/// Colunas (slots) por tile do GEMM dos experts — o `BN` do `mul_mm.comp` com `COLS = 32`.
+pub(crate) const MOE_BN: usize = 32;
 
 /// Linhas que um workgroup do `moe_matvec.comp` cobre: 4 waves × 2 linhas, vezes as
 /// linhas que cada wave pega por passada quando a linha tem menos de 8 superblocos.
@@ -267,6 +282,8 @@ fn gemm_para(cols: usize, ty: gguf::GgmlType) -> bool {
         // Q3_K: o matvec-COLS dele no bloco 32 lia a 6–9 GB/s (35 ms de 91 por bloco no
         // Qwen3.8-35B-A3B); o GEMM é o caminho do Q6_K com outro desempacotamento.
         gguf::GgmlType::Q3_K => true,
+        // Acima de 32 colunas o matvec-COLS não existe: vai pelo GEMM.
+        gguf::GgmlType::Q8_0 => cols > MATVEC_COLS_MAX,
         gguf::GgmlType::Q5_K => k56,
         // Acima de 32 colunas o matvec-COLS não existe mais: vai pelo GEMM de qualquer jeito.
         gguf::GgmlType::Q6_K => {
@@ -533,6 +550,8 @@ pub(crate) struct MoeBufs {
     pub xd: Buf,
     /// Saída do `down` de cada slot: [n_usados * n_embd].
     pub y: Buf,
+    /// Tiles e slots agrupados por expert para o GEMM do prefill — ver `moe_contar.comp`.
+    pub mapa: Buf,
 }
 
 /// Pesos quantizados do que fica entre as duas normas da camada, já na VRAM.
@@ -644,6 +663,8 @@ pub(crate) enum PipeId {
     MulMmQ6K,
     /// O mesmo GEMM para Q3_K (`TIPO = 3`).
     MulMmQ3K,
+    /// E para Q8_0 (`TIPO = 4`), só acima de 32 colunas.
+    MulMmQ80,
     /// As mesmas quatro com `COLS = VERIFY_TOK`: só o plano de verify do MTP as usa.
     MatvecV,
     MatvecQ5KV,
@@ -681,6 +702,10 @@ pub(crate) enum PipeId {
     MoeRouter,
     MoeTopk,
     MoeCombine,
+    MoeContar,
+    /// GEMM dos experts no prefill (`mul_mm.comp` com `MOE = 1`).
+    MulMmMoeQ3K,
+    MulMmMoeIq3,
 }
 
 impl PipeId {
@@ -698,6 +723,7 @@ impl PipeId {
             PipeId::MulMmQ5K => "mul_mm_q5k",
             PipeId::MulMmQ6K => "mul_mm_q6k",
             PipeId::MulMmQ3K => "mul_mm_q3k",
+            PipeId::MulMmQ80 => "mul_mm_q80",
             PipeId::MatvecV => "matvec_v",
             PipeId::MatvecQ5KV => "matvec_q5k_v",
             PipeId::MatvecQ6KV => "matvec_q6k_v",
@@ -726,6 +752,9 @@ impl PipeId {
             PipeId::MoeRouter => "moe_router",
             PipeId::MoeTopk => "moe_topk",
             PipeId::MoeCombine => "moe_combine",
+            PipeId::MoeContar => "moe_contar",
+            PipeId::MulMmMoeQ3K => "mul_mm_moe_q3k",
+            PipeId::MulMmMoeIq3 => "mul_mm_moe_iq3",
         }
     }
 
@@ -752,6 +781,7 @@ impl PipeId {
             | PipeId::MulMmQ5K
             | PipeId::MulMmQ6K
             | PipeId::MulMmQ3K
+            | PipeId::MulMmQ80
             | PipeId::MatvecV
             | PipeId::MatvecQ5KV
             | PipeId::MatvecQ6KV
@@ -761,7 +791,11 @@ impl PipeId {
             | PipeId::MatvecQ3KV
             // weight, xq, xd, ids → out
             | PipeId::MoeQ3K
-            | PipeId::MoeIq3 => (&[0, 1, 2, 4], &[3]),
+            | PipeId::MoeIq3
+            // weight, xq, xd, mapa → out
+            | PipeId::MulMmMoeQ3K
+            | PipeId::MulMmMoeIq3 => (&[0, 1, 2, 4], &[3]),
+            PipeId::MoeContar => (&[0], &[1]),
             PipeId::MoeRouter => (&[0, 1], &[2]),
             PipeId::MoeTopk => (&[0], &[1, 2]),
             // a saída do FFN é inout: entra o compartilhado, sai a soma.
@@ -1145,6 +1179,7 @@ pub struct ResidentForward<'ctx> {
     pub(crate) mul_mm_q5k: ComputePipeline,
     pub(crate) mul_mm_q6k: ComputePipeline,
     pub(crate) mul_mm_q3k: ComputePipeline,
+    pub(crate) mul_mm_q80: ComputePipeline,
     // As mesmas quatro com COLS = VERIFY_TOK, para o plano de verify do MTP.
     pub(crate) matvec_v: ComputePipeline,
     pub(crate) matvec_q5k_v: ComputePipeline,
@@ -1180,6 +1215,9 @@ pub struct ResidentForward<'ctx> {
     pub(crate) moe_router: ComputePipeline,
     pub(crate) moe_topk: ComputePipeline,
     pub(crate) moe_combine: ComputePipeline,
+    pub(crate) moe_contar: ComputePipeline,
+    pub(crate) mul_mm_moe_q3k: ComputePipeline,
+    pub(crate) mul_mm_moe_iq3: ComputePipeline,
     pub(crate) desc_pool: vk::DescriptorPool,
     pub(crate) state: Option<ResidentState<'ctx>>,
     /// Clock fixo enquanto houver geração (ver `pstate.rs`). Só no backend carregado.
@@ -1458,6 +1496,8 @@ impl<'ctx> ResidentForward<'ctx> {
             ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, gemm_cols), (1, 2)])?;
         let mul_mm_q3k =
             ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, gemm_cols), (1, 3)])?;
+        let mul_mm_q80 =
+            ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, gemm_cols), (1, 4)])?;
         // Verify do MTP: `COLS = 2` fixo, com a geometria do **decode** e não a do prefill.
         // O que decide a ocupância é `ROWS_PER_WAVE * COLS` acumuladores vivos por lane, e
         // com duas colunas isso fica perto do decode (COLS=1) e longe das oito do bloco de
@@ -1523,9 +1563,16 @@ impl<'ctx> ResidentForward<'ctx> {
         let moe_iq3 = ComputePipeline::with(d, crate::MOE_MATVEC_SPV, 5, 16, &[(0, 1)])?;
         // (peso, x, logits) + n_in, n_linhas; (logits, ids, w) + n_expert, n_usados;
         // (f inout, y, w) + n_embd, n_usados.
-        let moe_router = ComputePipeline::with(d, crate::MOE_ROUTER_SPV, 3, 8, &[])?;
+        let moe_router = ComputePipeline::with(d, crate::MOE_ROUTER_SPV, 3, 12, &[])?;
         let moe_topk = ComputePipeline::with(d, crate::MOE_TOPK_SPV, 3, 8, &[])?;
         let moe_combine = ComputePipeline::with(d, crate::MOE_COMBINE_SPV, 3, 8, &[])?;
+        // (ids, mapa) + n_slots, n_expert, bn, max_tiles.
+        let moe_contar = ComputePipeline::with(d, crate::MOE_CONTAR_SPV, 2, 16, &[])?;
+        let bn = MOE_BN as u32;
+        let mul_mm_moe_q3k =
+            ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, bn), (1, 3), (2, 1)])?;
+        let mul_mm_moe_iq3 =
+            ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, bn), (1, 5), (2, 1)])?;
 
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -1560,6 +1607,7 @@ impl<'ctx> ResidentForward<'ctx> {
             mul_mm_q5k,
             mul_mm_q6k,
             mul_mm_q3k,
+            mul_mm_q80,
             matvec_v,
             matvec_q5k_v,
             matvec_q6k_v,
@@ -1589,6 +1637,9 @@ impl<'ctx> ResidentForward<'ctx> {
             moe_router,
             moe_topk,
             moe_combine,
+            moe_contar,
+            mul_mm_moe_q3k,
+            mul_mm_moe_iq3,
             desc_pool,
             state: None,
             pstate: None,
@@ -2067,6 +2118,10 @@ impl<'ctx> ResidentForward<'ctx> {
                             xq: nf(slots / 32 * 8)?,
                             xd: nf(slots / 32)?,
                             y: nf(m.n_usados * config.n_embd)?,
+                            mapa: {
+                                let slots = m.n_usados * nblk;
+                                nf1(2 + 3 * max_tiles_moe(m.n_expert, slots) + slots)?
+                            },
                         })
                     }
                     None => None,
@@ -3898,6 +3953,7 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::MulMmQ5K => &self.mul_mm_q5k,
             PipeId::MulMmQ6K => &self.mul_mm_q6k,
             PipeId::MulMmQ3K => &self.mul_mm_q3k,
+            PipeId::MulMmQ80 => &self.mul_mm_q80,
             PipeId::MatvecV => &self.matvec_v,
             PipeId::MatvecQ5KV => &self.matvec_q5k_v,
             PipeId::MatvecQ6KV => &self.matvec_q6k_v,
@@ -3928,6 +3984,9 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::MoeRouter => &self.moe_router,
             PipeId::MoeTopk => &self.moe_topk,
             PipeId::MoeCombine => &self.moe_combine,
+            PipeId::MoeContar => &self.moe_contar,
+            PipeId::MulMmMoeQ3K => &self.mul_mm_moe_q3k,
+            PipeId::MulMmMoeIq3 => &self.mul_mm_moe_iq3,
         }
     }
 
@@ -4178,6 +4237,7 @@ impl<'ctx> ResidentForward<'ctx> {
                     gguf::GgmlType::Q5_K => PipeId::MulMmQ5K,
                     gguf::GgmlType::Q6_K => PipeId::MulMmQ6K,
                     gguf::GgmlType::Q3_K => PipeId::MulMmQ3K,
+                    gguf::GgmlType::Q8_0 => PipeId::MulMmQ80,
                     _ => PipeId::MulMmQ4K,
                 };
                 (gemm, GEMM_LINHAS_POR_WG as usize)
@@ -4737,19 +4797,21 @@ impl<'ctx> ResidentForward<'ctx> {
         };
 
         let mut plan = Vec::with_capacity(8);
-        plan.push(Self::com_y(
-            self.mk_op(
-                PipeId::MoeRouter,
-                &[
-                    (rot.buffer, 0, rot.size),
-                    (st.b_normed.buffer, 0, nbt(c.n_embd)),
-                    (mb.logits.buffer, 0, nbt(mc.n_expert + 1)),
-                ],
-                u32::try_from((mc.n_expert + 1).div_ceil(4)).unwrap_or(u32::MAX),
-                u32s(&[c.n_embd, mc.n_expert + 1]),
-            )?,
-            nt,
-        ));
+        // Cada workgroup cobre 8 tokens do bloco: o peso f32 é lido uma vez para os 8.
+        plan.push(self.mk_op(
+            PipeId::MoeRouter,
+            &[
+                (rot.buffer, 0, rot.size),
+                (st.b_normed.buffer, 0, nbt(c.n_embd)),
+                (mb.logits.buffer, 0, nbt(mc.n_expert + 1)),
+            ],
+            u32::try_from((mc.n_expert + 1).div_ceil(4)).unwrap_or(u32::MAX),
+            u32s(&[c.n_embd, mc.n_expert + 1, n_tok]),
+        )?);
+        // `TOK_POR_WG` do shader: 8 tokens por workgroup em Y.
+        if let Some(PlannedOp::Dispatch { groups_y, .. }) = plan.last_mut() {
+            *groups_y = u32::try_from(n_tok.div_ceil(8)).unwrap_or(1);
+        }
         plan.push(self.mk_op(
             PipeId::MoeTopk,
             &[
@@ -4760,7 +4822,55 @@ impl<'ctx> ResidentForward<'ctx> {
             nt,
             u32s(&[mc.n_expert, mc.n_usados]),
         )?);
-        plan.push(moe_mv(
+        // No bloco de prefill os slots são agrupados por expert e os experts vão pelo GEMM:
+        // cada peso sai da memória uma vez para todos os tokens que o escolheram. No decode
+        // (um token, 8 slots) o matvec por slot já lê cada peso uma vez.
+        let agrupar = n_tok > 1;
+        let max_tiles = max_tiles_moe(mc.n_expert, slots);
+        if agrupar {
+            plan.push(self.mk_op(
+                PipeId::MoeContar,
+                &[
+                    (mb.ids.buffer, 0, nbt(mc.n_usados)),
+                    (mb.mapa.buffer, 0, mb.mapa.size),
+                ],
+                1,
+                u32s(&[slots, mc.n_expert, MOE_BN, max_tiles]),
+            )?);
+        }
+        let moe_gemm = |w: &QWeight,
+                        ativ: (&Buf, &Buf),
+                        dst: &Buf,
+                        n_in: usize,
+                        n_out: usize,
+                        x_por_slot: bool|
+         -> Result<PlannedOp, MatmulError> {
+            if !agrupar {
+                return moe_mv(w, ativ, dst, n_in, n_out, x_por_slot);
+            }
+            let pipe = match w.ty {
+                gguf::GgmlType::Q3_K => PipeId::MulMmMoeQ3K,
+                gguf::GgmlType::IQ3_XXS => PipeId::MulMmMoeIq3,
+                outro => {
+                    eprintln!("[plano] experts {outro:?} não têm GEMM na GPU");
+                    return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+                }
+            };
+            let op = self.mk_op(
+                pipe,
+                &[
+                    (w.gpu.buffer, 0, w.gpu.size_bytes),
+                    (ativ.0.buffer, 0, ativ.0.size),
+                    (ativ.1.buffer, 0, ativ.1.size),
+                    (dst.buffer, 0, ((n_out * slots) * 4) as vk::DeviceSize),
+                    (mb.mapa.buffer, 0, mb.mapa.size),
+                ],
+                u32::try_from(n_out.div_ceil(GEMM_LINHAS_POR_WG as usize)).unwrap_or(u32::MAX),
+                u32s(&[n_in, n_out, mc.n_usados, usize::from(x_por_slot)]),
+            )?;
+            Ok(Self::com_y(op, u32::try_from(max_tiles).unwrap_or(1)))
+        };
+        plan.push(moe_gemm(
             &mq.gate_exps,
             (&st.b_xq, &st.b_xd),
             &mb.g,
@@ -4768,7 +4878,7 @@ impl<'ctx> ResidentForward<'ctx> {
             mc.n_ff_exp,
             false,
         )?);
-        plan.push(moe_mv(
+        plan.push(moe_gemm(
             &mq.up_exps,
             (&st.b_xq, &st.b_xd),
             &mb.u,
@@ -4788,7 +4898,7 @@ impl<'ctx> ResidentForward<'ctx> {
             u32::try_from((ff_slots * n_tok / 32).div_ceil(64)).unwrap_or(u32::MAX),
             u32s(&[ff_slots * n_tok]),
         )?);
-        plan.push(moe_mv(
+        plan.push(moe_gemm(
             &mq.down_exps,
             (&mb.xq, &mb.xd),
             &mb.y,
@@ -6028,7 +6138,7 @@ impl Drop for ResidentForward<'_> {
             st.output_w.gpu.destroy(d);
             if let Some(m) = &st.moe {
                 for b in [
-                    &m.logits, &m.ids, &m.w, &m.g, &m.u, &m.act, &m.xq, &m.xd, &m.y,
+                    &m.logits, &m.ids, &m.w, &m.g, &m.u, &m.act, &m.xq, &m.xd, &m.y, &m.mapa,
                 ] {
                     b.destroy(d);
                 }

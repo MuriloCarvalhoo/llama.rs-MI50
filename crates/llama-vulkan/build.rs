@@ -39,6 +39,7 @@ fn main() {
         ("moe_router.comp", "MOE_ROUTER_SPV"),
         ("moe_topk.comp", "MOE_TOPK_SPV"),
         ("moe_combine.comp", "MOE_COMBINE_SPV"),
+        ("moe_contar.comp", "MOE_CONTAR_SPV"),
     ];
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());

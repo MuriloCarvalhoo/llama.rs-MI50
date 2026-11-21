@@ -56,8 +56,9 @@ layout(local_size_x = 256) in;
 // Colunas = tokens do bloco de prefill. Ate 32, multiplo de 8 (a grade de threads tem 8
 // grupos de coluna); acima disso, multiplo de 32 (um tile de 32 por `gl_WorkGroupID.y`).
 layout(constant_id = 0) const uint COLS = 32u;
-// Tipo do peso: 0 = Q4_K, 1 = Q5_K, 2 = Q6_K, 3 = Q3_K (o caminho do Q6_K: int8 com sinal,
-// duas escalas de 16 por passo, sem mínimo — ver `q3_k_matvec.comp` para o layout). Só a carga e o desempacotamento do tile de
+// Tipo do peso: 0 = Q4_K, 1 = Q5_K, 2 = Q6_K, 3 = Q3_K, 4 = Q8_0. Os três últimos vão pelo
+// caminho de int8 com sinal e duas escalas de 16 por passo, sem mínimo (no Q8_0 as duas são
+// a mesma) — ver `q3_k_matvec.comp` e `q8_0_matvec.comp` para os layouts. Só a carga e o desempacotamento do tile de
 // peso mudam — na LDS os três viram int8 com escala por sub-bloco, e o laço de conta é o
 // mesmo (o Q6_K com duas escalas por passo de K, porque o sub-bloco dele tem 16 elementos,
 // e sem termo de mínimo: o -32 já sai no desempacotamento).
@@ -66,8 +67,17 @@ const uint Q4K = 0u;
 const uint Q5K = 1u;
 const uint Q6K = 2u;
 const uint Q3K = 3u;
-// Q6_K e Q3_K: sub-blocos de 16 com escala própria e nenhum termo de mínimo.
-const bool DUAS_ESCALAS = TIPO == Q6K || TIPO == Q3K;
+const uint Q80 = 4u;
+// IQ3_XXS (só nos experts): o layout reempacotado de `moe_matvec.comp`, com o sinal aplicado
+// no desempacotamento e uma escala por bloco de 32 (as duas metades com a mesma).
+const uint IQ3 = 5u;
+// Q6_K, Q3_K, Q8_0 e IQ3_XXS: escala por metade de 16 e nenhum termo de mínimo.
+const bool DUAS_ESCALAS = TIPO == Q6K || TIPO == Q3K || TIPO == Q80 || TIPO == IQ3;
+// 1 = GEMM dos experts de um MoE. Cada workgroup em Y é um tile da lista que o
+// `moe_contar.comp` montou: um expert e até BN slots (token, k) que o escolheram. O peso do
+// expert sai da memória uma vez para todos eles — é o `mul_mm_id` do llama.cpp. O binding 4
+// vira o mapa de tiles, e os dois últimos campos do push viram `n_usados` e `x_por_slot`.
+layout(constant_id = 2) const uint MOE = 0u;
 
 const uint BM = 128u;          // linhas de saida por workgroup
 const uint BK = 32u;           // elementos de K por passo — o sub-bloco do Q4_K
@@ -96,6 +106,7 @@ layout(set = 0, binding = 1) readonly buffer XqBuf { int xq[]; } xq_buf;
 layout(set = 0, binding = 2) readonly buffer XdBuf { float xd[]; } xd_buf;
 layout(set = 0, binding = 3) writeonly buffer OutBuf { float y[]; } out_buf;
 layout(set = 0, binding = 4) readonly buffer BiasBuf { float b[]; } bias_buf;
+layout(set = 0, binding = 4) readonly buffer MapaBuf { uint m[]; } mapa;
 
 layout(push_constant) uniform PC {
     uint n_in;
@@ -105,8 +116,10 @@ layout(push_constant) uniform PC {
 } pc;
 
 // uvec4 por superbloco: 144 bytes no Q4_K, 176 no Q5_K. O Q6_K conta em uints.
-const uint UVEC4_PER_SB = TIPO == Q5K ? 11u : (TIPO == Q3K ? 7u : 9u);
+const uint UVEC4_PER_SB = TIPO == Q5K ? 11u : ((TIPO == Q3K || TIPO == IQ3) ? 7u : 9u);
 const uint UINTS_PER_SB_Q6K = 53u;
+// Q8_0 sobe como 8 blocos de 36 bytes (escala f16 | pad | 32 int8) por 256 elementos.
+const uint UINTS_PER_SB_Q80 = 72u;
 
 // Tile de peso: BM linhas x 32 int8, empacotados 4 por uint.
 shared uint lw[BM * LDS_PASSO];
@@ -115,6 +128,59 @@ shared float lwsc2[BM];   // Q6_K: d * sc da segunda metade de 16
 shared float lwoff[BM];   // -dmin * m do sub-bloco (Q4_K/Q5_K)
 // Tile de ativacao: BN colunas x 32 int8, mais escala e soma dos int8 por coluna.
 shared int lx[BN * LDS_PASSO];
+// MoE: o slot de cada coluna do tile e a coluna da ativação que ele lê.
+shared uint slot_de[32];
+shared uint xcol_de[32];
+// IQ3_XXS: a grade de magnitudes, copiada para a LDS no início.
+shared uint grade[256];
+
+// `iq3xxs_grid` de `ggml-common.h`.
+const uint IQ3XXS_GRID[256] = uint[256](
+    0x04040404u, 0x04040414u, 0x04040424u, 0x04040c0cu, 0x04040c1cu, 0x04040c3eu, 0x04041404u, 0x04041414u,
+    0x04041c0cu, 0x04042414u, 0x04043e1cu, 0x04043e2cu, 0x040c040cu, 0x040c041cu, 0x040c0c04u, 0x040c0c14u,
+    0x040c140cu, 0x040c142cu, 0x040c1c04u, 0x040c1c14u, 0x040c240cu, 0x040c2c24u, 0x040c3e04u, 0x04140404u,
+    0x04140414u, 0x04140424u, 0x04140c0cu, 0x04141404u, 0x04141414u, 0x04141c0cu, 0x04141c1cu, 0x04141c3eu,
+    0x04142c0cu, 0x04142c3eu, 0x04143e2cu, 0x041c040cu, 0x041c043eu, 0x041c0c04u, 0x041c0c14u, 0x041c142cu,
+    0x041c3e04u, 0x04240c1cu, 0x04241c3eu, 0x04242424u, 0x04242c3eu, 0x04243e1cu, 0x04243e2cu, 0x042c040cu,
+    0x042c043eu, 0x042c1c14u, 0x042c2c14u, 0x04341c2cu, 0x04343424u, 0x043e0c04u, 0x043e0c24u, 0x043e0c34u,
+    0x043e241cu, 0x043e340cu, 0x0c04040cu, 0x0c04041cu, 0x0c040c04u, 0x0c040c14u, 0x0c04140cu, 0x0c04141cu,
+    0x0c041c04u, 0x0c041c14u, 0x0c041c24u, 0x0c04243eu, 0x0c042c04u, 0x0c0c0404u, 0x0c0c0414u, 0x0c0c0c0cu,
+    0x0c0c1404u, 0x0c0c1414u, 0x0c14040cu, 0x0c14041cu, 0x0c140c04u, 0x0c140c14u, 0x0c14140cu, 0x0c141c04u,
+    0x0c143e14u, 0x0c1c0404u, 0x0c1c0414u, 0x0c1c1404u, 0x0c1c1c0cu, 0x0c1c2434u, 0x0c1c3434u, 0x0c24040cu,
+    0x0c24042cu, 0x0c242c04u, 0x0c2c1404u, 0x0c2c1424u, 0x0c2c2434u, 0x0c2c3e0cu, 0x0c34042cu, 0x0c3e1414u,
+    0x0c3e2404u, 0x14040404u, 0x14040414u, 0x14040c0cu, 0x14040c1cu, 0x14041404u, 0x14041414u, 0x14041434u,
+    0x14041c0cu, 0x14042414u, 0x140c040cu, 0x140c041cu, 0x140c042cu, 0x140c0c04u, 0x140c0c14u, 0x140c140cu,
+    0x140c1c04u, 0x140c341cu, 0x140c343eu, 0x140c3e04u, 0x14140404u, 0x14140414u, 0x14140c0cu, 0x14140c3eu,
+    0x14141404u, 0x14141414u, 0x14141c3eu, 0x14142404u, 0x14142c2cu, 0x141c040cu, 0x141c0c04u, 0x141c0c24u,
+    0x141c3e04u, 0x141c3e24u, 0x14241c2cu, 0x14242c1cu, 0x142c041cu, 0x142c143eu, 0x142c240cu, 0x142c3e24u,
+    0x143e040cu, 0x143e041cu, 0x143e0c34u, 0x143e242cu, 0x1c04040cu, 0x1c040c04u, 0x1c040c14u, 0x1c04140cu,
+    0x1c04141cu, 0x1c042c04u, 0x1c04342cu, 0x1c043e14u, 0x1c0c0404u, 0x1c0c0414u, 0x1c0c1404u, 0x1c0c1c0cu,
+    0x1c0c2424u, 0x1c0c2434u, 0x1c14040cu, 0x1c14041cu, 0x1c140c04u, 0x1c14142cu, 0x1c142c14u, 0x1c143e14u,
+    0x1c1c0c0cu, 0x1c1c1c1cu, 0x1c241c04u, 0x1c24243eu, 0x1c243e14u, 0x1c2c0404u, 0x1c2c0434u, 0x1c2c1414u,
+    0x1c2c2c2cu, 0x1c340c24u, 0x1c341c34u, 0x1c34341cu, 0x1c3e1c1cu, 0x1c3e3404u, 0x24040424u, 0x24040c3eu,
+    0x24041c2cu, 0x24041c3eu, 0x24042c1cu, 0x24042c3eu, 0x240c3e24u, 0x24141404u, 0x24141c3eu, 0x24142404u,
+    0x24143404u, 0x24143434u, 0x241c043eu, 0x241c242cu, 0x24240424u, 0x24242c0cu, 0x24243424u, 0x242c142cu,
+    0x242c241cu, 0x242c3e04u, 0x243e042cu, 0x243e0c04u, 0x243e0c14u, 0x243e1c04u, 0x2c040c14u, 0x2c04240cu,
+    0x2c043e04u, 0x2c0c0404u, 0x2c0c0434u, 0x2c0c1434u, 0x2c0c2c2cu, 0x2c140c24u, 0x2c141c14u, 0x2c143e14u,
+    0x2c1c0414u, 0x2c1c2c1cu, 0x2c240c04u, 0x2c24141cu, 0x2c24143eu, 0x2c243e14u, 0x2c2c0414u, 0x2c2c1c0cu,
+    0x2c342c04u, 0x2c3e1424u, 0x2c3e2414u, 0x34041424u, 0x34042424u, 0x34042434u, 0x34043424u, 0x340c140cu,
+    0x340c340cu, 0x34140c3eu, 0x34143424u, 0x341c1c04u, 0x341c1c34u, 0x34242424u, 0x342c042cu, 0x342c2c14u,
+    0x34341c1cu, 0x343e041cu, 0x343e140cu, 0x3e04041cu, 0x3e04042cu, 0x3e04043eu, 0x3e040c04u, 0x3e041c14u,
+    0x3e042c14u, 0x3e0c1434u, 0x3e0c2404u, 0x3e140c14u, 0x3e14242cu, 0x3e142c14u, 0x3e1c0404u, 0x3e1c0c2cu,
+    0x3e1c1c1cu, 0x3e1c3404u, 0x3e24140cu, 0x3e24240cu, 0x3e2c0404u, 0x3e2c0414u, 0x3e2c1424u, 0x3e341c04u
+);
+
+// Linha de peso do expert do tile (0 fora do MoE) — somada ao índice de linha nos loads.
+uint base_linha = 0u;
+
+// Coluna da ativação para a coluna `c` do tile.
+uint coluna(uint col0, uint c) {
+    return MOE == 1u ? xcol_de[c] : col0 + c;
+}
+
+uint mascara_neg(uint nib) {
+    return ((nib * 0x00204081u) & 0x01010101u) * 0xFFu;
+}
 shared float lxd[BN];
 shared float lxs[BN];
 
@@ -159,7 +225,7 @@ void buscar(uint k0, uint lg, uint linha4, uint n_blk, bool w_alta, uint x_col, 
             // `linha4` conta uints aqui. O passo j cobre os sub-blocos de 16 `2j` e `2j+1`;
             // no layout do ggml ficam na metade j/4 do superbloco, no quarto j%4 (ver
             // `q6_k_matvec.comp`), com 16 bytes contíguos de `ql` e de `qh` para cada um.
-            uint bu = lg * linha4 + sb * UINTS_PER_SB_Q6K;
+            uint bu = (base_linha + lg) * linha4 + sb * UINTS_PER_SB_Q6K;
             uint metade = j >> 2u;
             uint quarto = j & 3u;
             uint idx16 = w_alta ? 16u : 0u;
@@ -172,16 +238,34 @@ void buscar(uint k0, uint lg, uint linha4, uint n_blk, bool w_alta, uint x_col, 
             uint sub = 2u * j + (w_alta ? 1u : 0u);
             hdr.x = weight_u.w[bu + 52u];              // d nos bytes 208..209
             hdr.y = weight_u.w[bu + ((192u + sub) >> 2u)];
+        } else if (TIPO == Q80) {
+            // Bloco `blk` da linha: 9 uints; a metade desta thread são os uints 1..4 ou 5..8.
+            uint bu = (base_linha + lg) * linha4 + blk * 9u;
+            uint q0 = bu + 1u + (w_alta ? 4u : 0u);
+            qs = uvec4(weight_u.w[q0], weight_u.w[q0 + 1u], weight_u.w[q0 + 2u],
+                       weight_u.w[q0 + 3u]);
+            hdr.x = weight_u.w[bu];
         } else if (TIPO == Q3K) {
             // Superbloco em 7 uvec4: hmask (0..1), qs (2..5), scales|d (6). A metade de 16
             // desta thread lê a metade correspondente de `hmask` e do pedaço `j/4` de `qs`.
-            uint b4 = lg * linha4 + sb * UVEC4_PER_SB;
+            uint b4 = (base_linha + lg) * linha4 + sb * UVEC4_PER_SB;
             uint h = w_alta ? 1u : 0u;
             qs = weight_buf.w4[b4 + 2u + 2u * (j >> 2u) + h];
             qh = weight_buf.w4[b4 + h];
             hdr = weight_buf.w4[b4 + 6u];
+        } else if (TIPO == IQ3) {
+            // 7 uvec4: qs (0..3), palavras de escala e sinal (4..5), d (6). A metade de 16
+            // desta thread são 4 índices de qs (um uint) e usa a palavra do sub-bloco `j`.
+            uint b4 = (base_linha + lg) * linha4 + sb * UVEC4_PER_SB;
+            uvec4 qv = weight_buf.w4[b4 + (j >> 1u)];
+            uint q = (j & 1u) * 2u + (w_alta ? 1u : 0u);
+            qs.x = q == 0u ? qv.x : (q == 1u ? qv.y : (q == 2u ? qv.z : qv.w));
+            uvec4 sv = weight_buf.w4[b4 + 4u + (j >> 2u)];
+            uint jj = j & 3u;
+            hdr.x = jj == 0u ? sv.x : (jj == 1u ? sv.y : (jj == 2u ? sv.z : sv.w));
+            hdr.y = weight_buf.w4[b4 + 6u].x;
         } else {
-            uint b4 = lg * linha4 + sb * UVEC4_PER_SB;
+            uint b4 = (base_linha + lg) * linha4 + sb * UVEC4_PER_SB;
             hdr = weight_buf.w4[b4];
             // No Q5_K `qh` são os uvec4 1..2 (os 32 bytes do 5º bit) e `qs` começa no 3.
             uint qs0 = TIPO == Q5K ? 3u : 1u;
@@ -192,10 +276,10 @@ void buscar(uint k0, uint lg, uint linha4, uint n_blk, bool w_alta, uint x_col, 
         }
     }
     if (x_col < BN) {
-        xq = xq_buf.xq[((col0 + x_col) * n_blk + blk) * 8u + x_u];
+        xq = xq_buf.xq[(coluna(col0, x_col) * n_blk + blk) * 8u + x_u];
     }
     if (t < BN) {
-        uint cb = (col0 + t) * n_blk + blk;
+        uint cb = coluna(col0, t) * n_blk + blk;
         xd = xd_buf.xd[cb];
         // O Q6_K e o Q3_K não têm termo de mínimo: a soma dos int8 da ativação não entra.
         if (!DUAS_ESCALAS) {
@@ -234,9 +318,34 @@ void main() {
     uint linha0 = gl_WorkGroupID.x * BM;
     uint col0 = gl_WorkGroupID.y * BN;   // primeira coluna (token) do tile
 
+    if (TIPO == IQ3) {
+        grade[t] = IQ3XXS_GRID[t];
+    }
+    // MoE: tile, expert e as colunas que ele cobre. Tiles além do total saem inteiros (o
+    // host despacha o teto, `max_tiles`), antes de qualquer barreira.
+    uint n_cols = BN;
+    if (MOE == 1u) {
+        uint tile = gl_WorkGroupID.y;
+        if (tile >= mapa.m[0]) { return; }
+        uint d = 2u + 3u * tile;
+        uint expert = mapa.m[d];
+        uint inicio = mapa.m[d + 1u];
+        n_cols = mapa.m[d + 2u];
+        base_linha = expert * pc.n_out;
+        col0 = 0u;
+        if (t < BN) {
+            // Colunas além do tile repetem a primeira: carga válida, resultado descartado.
+            uint s = mapa.m[mapa.m[1] + inicio + min(t, n_cols - 1u)];
+            slot_de[t] = s;
+            xcol_de[t] = pc.tem_bias != 0u ? s : s / pc.row_offset;
+        }
+    }
+    barrier();
+
     uint n_sb = pc.n_in / 256u;
     // Tamanho da linha de peso: em uvec4 (Q4_K/Q5_K) ou em uints (Q6_K).
-    uint linha4 = n_sb * (TIPO == Q6K ? UINTS_PER_SB_Q6K : UVEC4_PER_SB);
+    uint linha4 = n_sb * (TIPO == Q6K ? UINTS_PER_SB_Q6K
+                       : (TIPO == Q80 ? UINTS_PER_SB_Q80 : UVEC4_PER_SB));
     uint n_blk = pc.n_in / 32u;          // blocos de ativacao por coluna
 
     // Carga do tile de peso: duas threads por linha, uma para cada metade dos 32 elementos.
@@ -289,6 +398,27 @@ void main() {
             uint sub = 2u * j + (w_alta ? 1u : 0u);
             float ds = unpackHalf2x16(r_hdr.x).x
                      * float(int(((r_hdr.y >> (8u * (sub & 3u))) & 0xFFu) << 24u) >> 24);
+            if (w_alta) { lwsc2[w_linha] = ds; } else { lwsc[w_linha] = ds; }
+        } else if (lg < pc.n_out && TIPO == IQ3) {
+            // As duas palavras de 8 elementos desta metade: grade com o sinal aplicado. Toda
+            // magnitude da grade é ≥ 4, então negar byte a byte (xor + 1) não carrega.
+            uint aux = r_hdr.x;
+            for (uint li = 0u; li < 2u; li++) {
+                uint l = (w_alta ? 2u : 0u) + li;
+                uint s7 = (aux >> (7u * l)) & 127u;
+                uint sinais = s7 | ((bitCount(s7) & 1u) << 7u);
+                uint g1 = grade[(r_qs.x >> (16u * li)) & 0xFFu];
+                uint g2 = grade[(r_qs.x >> (16u * li + 8u)) & 0xFFu];
+                uint m1 = mascara_neg(sinais & 0xFu);
+                uint m2 = mascara_neg(sinais >> 4u);
+                lw[dst + 2u * li] = (g1 ^ m1) + (m1 & 0x01010101u);
+                lw[dst + 2u * li + 1u] = (g2 ^ m2) + (m2 & 0x01010101u);
+            }
+            float db = unpackHalf2x16(r_hdr.y).x * (0.5 + float(aux >> 28u)) * 0.5;
+            if (w_alta) { lwsc2[w_linha] = db; } else { lwsc[w_linha] = db; }
+        } else if (lg < pc.n_out && TIPO == Q80) {
+            for (uint u = 0u; u < 4u; u++) { lw[dst + u] = r_qs[u]; }
+            float ds = unpackHalf2x16(r_hdr.x).x;
             if (w_alta) { lwsc2[w_linha] = ds; } else { lwsc[w_linha] = ds; }
         } else if (lg < pc.n_out && TIPO == Q3K) {
             uint sh_q = 2u * (j & 3u);
@@ -389,6 +519,15 @@ void main() {
     for (uint r = 0u; r < TM; r++) {
         uint rr = linha0 + r * LINHA_GRUPOS + ti;
         if (rr >= pc.n_out) { continue; }
+        if (MOE == 1u) {
+            for (uint c = 0u; c < TN; c++) {
+                uint cl = tj * TN + c;
+                if (cl < n_cols) {
+                    out_buf.y[slot_de[cl] * pc.n_out + rr] = acc[r * TN + c];
+                }
+            }
+            continue;
+        }
         float bias = pc.tem_bias != 0u ? bias_buf.b[rr] : 0.0;
         for (uint c = 0u; c < TN; c++) {
             out_buf.y[(col0 + tj * TN + c) * pc.n_out + rr] = acc[r * TN + c] + bias;
