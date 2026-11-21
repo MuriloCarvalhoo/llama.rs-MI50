@@ -8,11 +8,8 @@ const MODELO: &str = "../../models/Qwen3.8-27B-Q5_K_M.gguf";
 
 // mmap é a única forma sã de abrir 18.5 GB num teste; `fs::read` traria o arquivo
 // inteiro para a RAM.
-#[allow(unsafe_code)]
-fn mapear() -> Option<memmap2::Mmap> {
-    let file = std::fs::File::open(Path::new(MODELO)).ok()?;
-    // SAFETY: arquivo tratado como imutável durante o teste.
-    unsafe { memmap2::Mmap::map(&file) }.ok()
+fn mapear() -> Option<llama_sys::Mmap> {
+    llama_sys::mapear(Path::new(MODELO)).ok()
 }
 
 #[test]

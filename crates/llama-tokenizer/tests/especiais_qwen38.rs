@@ -14,10 +14,8 @@ const IM_END: u32 = 248_046;
 const TOOL_CALL: u32 = 248_058;
 const THINK: u32 = 248_068;
 
-#[allow(unsafe_code)]
-fn mapear() -> Option<memmap2::Mmap> {
-    let file = std::fs::File::open(Path::new(MODELO)).ok()?;
-    unsafe { memmap2::Mmap::map(&file) }.ok()
+fn mapear() -> Option<llama_sys::Mmap> {
+    llama_sys::mapear(Path::new(MODELO)).ok()
 }
 
 #[test]

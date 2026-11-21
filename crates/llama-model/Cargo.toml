@@ -12,9 +12,11 @@ llama-sampling.workspace = true
 rand.workspace = true
 rayon.workspace = true
 half.workspace = true
+wide = "1.7.1"
+safe_arch = "1.2.0"
 
 [dev-dependencies]
-memmap2 = "0.9"
+llama-sys.workspace = true
 
 [features]
 gpu = []

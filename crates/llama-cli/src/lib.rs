@@ -1,4 +1,4 @@
-#![allow(unsafe_code)]
+#![forbid(unsafe_code)]
 //! Biblioteca auxiliar do `llama-cli`.
 //!
 //! Camada de aplicação (DDD): orquestra os contextos `gguf`, `llama-tokenizer`,

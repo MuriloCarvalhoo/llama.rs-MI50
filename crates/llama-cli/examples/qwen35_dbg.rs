@@ -11,11 +11,9 @@
     clippy::indexing_slicing
 )]
 
-#[allow(unsafe_code)]
 fn main() {
     let path = "models/Qwen3.8-27B-Q5_K_M.gguf";
-    let file = std::fs::File::open(path).unwrap();
-    let bytes = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+    let bytes = llama_sys::mapear(std::path::Path::new(path)).unwrap();
     let f = gguf::GgufFile::parse(&bytes).unwrap();
     let cfg = llama_model::LlamaConfig::from_gguf(&f).unwrap();
     let dn = cfg.delta_net.clone().unwrap();
