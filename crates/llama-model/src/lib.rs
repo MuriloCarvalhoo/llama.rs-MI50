@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 //! Inferência forward (CPU, f32) da arquitetura Llama. Escopo: stories260K.
 //!
 //! Contexto delimitado (DDD): definição e execução do modelo, independente do
@@ -26,7 +26,6 @@ mod mtp;
 mod ops;
 pub mod perfil_carga;
 mod sessao;
-pub(crate) mod spin_pool;
 mod weights;
 
 pub use config::{DeltaNetConfig, LlamaConfig, MoeConfig};
@@ -43,8 +42,3 @@ pub use mtp::MtpHead;
 #[cfg(feature = "gpu")]
 pub use sessao::Sessao;
 pub use sessao::{Reuso, planejar_reuso};
-
-/// Inicializa o spin pool com `n_workers` threads em background, pinados aos `cpus` fornecidos.
-pub fn init_spin_pool(n_workers: usize, cpus: Vec<usize>) {
-    spin_pool::init(n_workers, cpus);
-}
