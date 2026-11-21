@@ -85,7 +85,37 @@ impl<'ctx> LayerSplitForward<'ctx> {
                             .max(1)
                     })
                     .collect();
-                Self::split_points(&free, config.n_layer)
+                // Com limites de potência diferentes (a card1 desta máquina a 110 W, a outra
+                // a 190 W), a placa mais fraca roda as mesmas ops do prefill ~1,5× mais
+                // devagar, e no pipeline o bloco anda no passo da mais lenta: as camadas vão
+                // na proporção da potência, se couberem na VRAM.
+                let pot: Vec<Option<u64>> = devs.iter().map(|p| p.limite_potencia_w()).collect();
+                let por_potencia = match (pot.as_slice(), free.as_slice()) {
+                    ([Some(p0), Some(p1)], [f0, f1]) => {
+                        let kv = (config.n_head_kv * config.head_dim * config.ctx * 2 * 2) as u64;
+                        let bytes: Vec<u64> = raw
+                            .layers
+                            .iter()
+                            .enumerate()
+                            .map(|(l, c)| {
+                                let atencao =
+                                    !config.delta_net.as_ref().is_some_and(|d| d.eh_linear(l));
+                                c.bytes_totais() as u64 + if atencao { kv } else { 0 }
+                            })
+                            .collect();
+                        ponto_por_potencia(
+                            [*p0, *p1],
+                            &bytes,
+                            raw.output.bytes.len() as u64,
+                            [*f0, *f1],
+                        )
+                    }
+                    _ => None,
+                };
+                match por_potencia {
+                    Some(n) => vec![(0, n), (n, config.n_layer)],
+                    None => Self::split_points(&free, config.n_layer),
+                }
             }
         };
 
@@ -132,6 +162,9 @@ impl<'ctx> LayerSplitForward<'ctx> {
     }
 
     /// Fronteiras `[first, end)` por device, proporcionais a `free`.
+    ///
+    /// Ver também [`ponto_por_potencia`], que tem precedência quando as duas placas têm
+    /// limites de potência diferentes.
     /// Extraído para poder ser testado sem GPU.
     pub(crate) fn split_points(free: &[u64], n_layer: usize) -> Vec<(usize, usize)> {
         let total: u128 = free.iter().map(|&f| u128::from(f)).sum::<u128>().max(1);
@@ -277,7 +310,8 @@ impl llama_model::GpuResidentDecode for LayerSplitForward<'_> {
             let h = a.concluir_lote(pos[k], blocos[k].len()).map_err(erro)?;
             if k > 0 {
                 // Só os logits do último bloco interessam.
-                b.concluir_lote(pos[k - 1], blocos[k - 1].len()).map_err(erro)?;
+                b.concluir_lote(pos[k - 1], blocos[k - 1].len())
+                    .map_err(erro)?;
             }
             b.iniciar_lote(blocos[k], pos[k], Some(&h)).map_err(erro)?;
             if let (Some(prox), Some(&pp)) = (blocos.get(k + 1), pos.get(k + 1)) {
@@ -285,7 +319,8 @@ impl llama_model::GpuResidentDecode for LayerSplitForward<'_> {
             }
         }
         let ultimo = blocos.len() - 1;
-        b.concluir_lote(pos[ultimo], blocos[ultimo].len()).map_err(erro)
+        b.concluir_lote(pos[ultimo], blocos[ultimo].len())
+            .map_err(erro)
     }
 
     /// Todos os shards decidem o mesmo bloco (`batch_do_modelo` olha o modelo inteiro).
@@ -379,9 +414,53 @@ impl llama_model::GpuResidentDecode for LayerSplitForward<'_> {
 
 use ash::vk;
 
+/// Fronteira entre duas GPUs na proporção dos limites de potência `pot` (W), ou `None`
+/// quando os limites são parecidos (menos de 10% de diferença — fica a divisão por VRAM) ou
+/// quando a divisão não cabe: `bytes[l]` é o que a camada `l` ocupa (pesos e KV), a última
+/// GPU leva também `extra_ultimo` (a projeção de vocabulário), e cada lado guarda 1 GiB de
+/// folga para ativações e buffers sobre a VRAM livre `livre`.
+pub(crate) fn ponto_por_potencia(
+    pot: [u64; 2],
+    bytes: &[u64],
+    extra_ultimo: u64,
+    livre: [u64; 2],
+) -> Option<usize> {
+    let (p0, p1) = (pot[0].max(1), pot[1].max(1));
+    if p0.max(p1) * 10 < p0.min(p1) * 11 {
+        return None;
+    }
+    let n_layer = bytes.len();
+    let n = ((n_layer as u64 * p0 + (p0 + p1) / 2) / (p0 + p1)) as usize;
+    let n = n.clamp(1, n_layer.saturating_sub(1));
+    const FOLGA: u64 = 1 << 30;
+    let lado0: u64 = bytes[..n].iter().sum::<u64>() + FOLGA;
+    let lado1: u64 = bytes[n..].iter().sum::<u64>() + extra_ultimo + FOLGA;
+    (lado0 <= livre[0] && lado1 <= livre[1]).then_some(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::LayerSplitForward as L;
+
+    #[test]
+    fn potencia_diferente_desloca_camadas_para_a_placa_mais_forte() {
+        let gib = 1u64 << 30;
+        // 190 W contra 110 W: 63% das 40 camadas na primeira.
+        assert_eq!(
+            super::ponto_por_potencia([190, 110], &[gib / 4; 40], gib / 2, [15 * gib, 14 * gib]),
+            Some(25)
+        );
+        // Potências parecidas: fica a divisão por VRAM.
+        assert_eq!(
+            super::ponto_por_potencia([190, 180], &[gib / 4; 40], 0, [15 * gib, 15 * gib]),
+            None
+        );
+        // Não cabe na placa mais forte: fica a divisão por VRAM.
+        assert_eq!(
+            super::ponto_por_potencia([190, 110], &[gib / 2; 40], 0, [12 * gib, 16 * gib]),
+            None
+        );
+    }
 
     #[test]
     fn divide_proporcional_a_vram_livre() {

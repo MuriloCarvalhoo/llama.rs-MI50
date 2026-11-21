@@ -6156,7 +6156,11 @@ impl<'ctx> ResidentForward<'ctx> {
         let espera = self.espera_fence(st);
         self.em_voo.set(false);
         espera?;
-        let t_sub = self.t_submit.take().map(|t| t.elapsed()).unwrap_or_default();
+        let t_sub = self
+            .t_submit
+            .take()
+            .map(|t| t.elapsed())
+            .unwrap_or_default();
         let t2 = std::time::Instant::now();
         // O perfil do prefill acumula o bloco cheio; o do resto tem outra lista de ops.
         if modo != Modo::Batch || n_tok == st.cfg.n_batch {

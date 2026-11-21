@@ -107,6 +107,21 @@ impl VulkanPhysicalDevice {
 
     /// Bytes de VRAM que têm de sobrar livres neste device depois da carga: 2 GiB se ele
     /// dirige um monitor, 500 MiB se não (ver `MARGEM_COM_MONITOR`).
+    /// Limite de potência do device em watts (`power1_cap` do hwmon), se o sysfs o expõe.
+    pub fn limite_potencia_w(&self) -> Option<u64> {
+        let hwmon = std::path::Path::new("/sys/bus/pci/devices")
+            .join(self.pci.as_ref()?)
+            .join("hwmon");
+        std::fs::read_dir(hwmon).ok()?.flatten().find_map(|h| {
+            let uw: u64 = std::fs::read_to_string(h.path().join("power1_cap"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()?;
+            Some(uw / 1_000_000)
+        })
+    }
+
     pub fn margem_vram(&self) -> u64 {
         self.margem_vram
     }
