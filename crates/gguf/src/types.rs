@@ -20,6 +20,7 @@ pub enum GgmlType {
     Q5_K,
     Q6_K,
     Q8_K,
+    IQ3_XXS,
     Bf16,
     I8,
     I16,
@@ -51,7 +52,8 @@ impl GgmlType {
             | GgmlType::Q4_K
             | GgmlType::Q5_K
             | GgmlType::Q6_K
-            | GgmlType::Q8_K => 256,
+            | GgmlType::Q8_K
+            | GgmlType::IQ3_XXS => 256,
         }
     }
 
@@ -74,6 +76,7 @@ impl GgmlType {
             GgmlType::Q5_K => 176,
             GgmlType::Q6_K => 210,
             GgmlType::Q8_K => 292,
+            GgmlType::IQ3_XXS => 98,
         }
     }
 }
@@ -96,6 +99,7 @@ impl TryFrom<u32> for GgmlType {
             13 => GgmlType::Q5_K,
             14 => GgmlType::Q6_K,
             15 => GgmlType::Q8_K,
+            18 => GgmlType::IQ3_XXS,
             24 => GgmlType::I8,
             25 => GgmlType::I16,
             26 => GgmlType::I32,

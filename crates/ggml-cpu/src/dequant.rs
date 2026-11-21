@@ -6,13 +6,15 @@ use gguf::GgmlType;
 use crate::error::DequantError;
 
 /// Converte `bytes` brutos de um tensor para `Vec<f32>`.
-/// Suporta F32, F16, Q8_0, Q4_0, Q4_K, Q6_K.
+/// Suporta F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K e IQ3_XXS.
 pub fn dequant_to_f32(bytes: &[u8], ty: GgmlType) -> Result<Vec<f32>, DequantError> {
     match ty {
         GgmlType::F32 => dequant_f32(bytes),
         GgmlType::F16 => dequant_f16(bytes),
         GgmlType::Q8_0 => dequant_q8_0(bytes),
         GgmlType::Q4_0 => dequant_q4_0(bytes),
+        GgmlType::Q3_K => dequant_q3_k(bytes),
+        GgmlType::IQ3_XXS => dequant_iq3_xxs(bytes),
         GgmlType::Q4_K => dequant_q4_k(bytes),
         GgmlType::Q5_K => dequant_q5_k(bytes),
         GgmlType::Q6_K => dequant_q6_k(bytes),
@@ -201,6 +203,142 @@ fn dequant_q5_k(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
     }
     Ok(out)
 }
+
+/// Q3_K: superbloco de 256 elementos em 110 bytes — `hmask[32] | qs[64] | scales[12] | d(f16)`.
+///
+/// 16 escalas de 6 bits com offset 32: os 4 bits baixos estão em `scales[0..8]` (nibble baixo
+/// para as escalas 0–7, alto para 8–15) e os 2 altos em `scales[8..12]`. Cada elemento tem 2 bits
+/// em `qs` e um 3º em `hmask`; o 3º bit **zerado** subtrai 4. Mesma ordem de
+/// `dequantize_row_q3_K` do llama.cpp.
+fn dequant_q3_k(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
+    const BLOCK: usize = 110; // 32+64+12+2
+    if !bytes.len().is_multiple_of(BLOCK) {
+        return Err(DequantError::BadSize {
+            ty: "Q3_K",
+            block_bytes: BLOCK,
+            got: bytes.len(),
+        });
+    }
+    let n_blocks = bytes.len() / BLOCK;
+    let mut out = vec![0.0f32; n_blocks * 256];
+
+    for (bi, b) in bytes.as_chunks::<BLOCK>().0.iter().enumerate() {
+        let hm = &b[0..32];
+        let qs = &b[32..96];
+        let sc = &b[96..108];
+        let d_all = half::f16::from_bits(u16::from_le_bytes([b[108], b[109]])).to_f32();
+
+        let mut scales = [0i8; 16];
+        for (j, s) in scales.iter_mut().enumerate() {
+            let lo = if j < 8 { sc[j] & 0xF } else { sc[j - 8] >> 4 };
+            let hi = (sc[8 + j % 4] >> (2 * (j / 4))) & 3;
+            *s = (lo | (hi << 4)).cast_signed() - 32;
+        }
+
+        let mut y = bi * 256;
+        let mut is = 0usize;
+        let mut m: u8 = 1;
+        for q in qs.as_chunks::<32>().0 {
+            for shift in [0u8, 2, 4, 6] {
+                for metade in [0usize, 16] {
+                    let dl = d_all * f32::from(scales[is]);
+                    is += 1;
+                    for l in metade..metade + 16 {
+                        let v = ((q[l] >> shift) & 3).cast_signed()
+                            - if hm[l] & m != 0 { 0 } else { 4 };
+                        out[y] = dl * f32::from(v);
+                        y += 1;
+                    }
+                }
+                m = m.wrapping_shl(1);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// IQ3_XXS: superbloco de 256 elementos em 98 bytes — `d(f16) | qs[64] | escalas_e_sinais[32]`.
+///
+/// Cada `qs` indexa uma entrada de 4 magnitudes em `IQ3XXS_GRID`. Por grupo de 32 elementos, uma
+/// palavra de 32 bits traz a escala (4 bits altos) e quatro índices de sinal de 7 bits; o 8º bit
+/// de sinal é a paridade dos outros 7 (é o `ksigns_iq2xs` do llama.cpp, calculado em vez de
+/// tabelado). Mesma ordem de `dequantize_row_iq3_xxs`.
+fn dequant_iq3_xxs(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
+    const BLOCK: usize = 98; // 2+64+32
+    if !bytes.len().is_multiple_of(BLOCK) {
+        return Err(DequantError::BadSize {
+            ty: "IQ3_XXS",
+            block_bytes: BLOCK,
+            got: bytes.len(),
+        });
+    }
+    let n_blocks = bytes.len() / BLOCK;
+    let mut out = vec![0.0f32; n_blocks * 256];
+
+    for (bi, b) in bytes.as_chunks::<BLOCK>().0.iter().enumerate() {
+        let d = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
+        let qs = &b[2..66];
+        let escalas_e_sinais = &b[66..98];
+        let mut y = bi * 256;
+
+        for ib32 in 0..8 {
+            let p = &escalas_e_sinais[4 * ib32..4 * ib32 + 4];
+            let aux = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+            #[allow(clippy::cast_precision_loss)]
+            let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+            for l in 0..4 {
+                let s7 = ((aux >> (7 * l)) & 127) as u8;
+                let sinais = s7 | (((s7.count_ones() & 1) as u8) << 7);
+                let g1 = IQ3XXS_GRID[usize::from(qs[8 * ib32 + 2 * l])].to_le_bytes();
+                let g2 = IQ3XXS_GRID[usize::from(qs[8 * ib32 + 2 * l + 1])].to_le_bytes();
+                for j in 0..4 {
+                    let sinal = |bit: usize| if sinais & (1 << bit) != 0 { -1.0 } else { 1.0 };
+                    out[y + j] = db * f32::from(g1[j]) * sinal(j);
+                    out[y + 4 + j] = db * f32::from(g2[j]) * sinal(j + 4);
+                }
+                y += 8;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `iq3xxs_grid` de `ggml-common.h`: 256 entradas de 4 magnitudes de 8 bits.
+#[rustfmt::skip]
+const IQ3XXS_GRID: [u32; 256] = [
+    0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
+    0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
+    0x040c140c, 0x040c142c, 0x040c1c04, 0x040c1c14, 0x040c240c, 0x040c2c24, 0x040c3e04, 0x04140404,
+    0x04140414, 0x04140424, 0x04140c0c, 0x04141404, 0x04141414, 0x04141c0c, 0x04141c1c, 0x04141c3e,
+    0x04142c0c, 0x04142c3e, 0x04143e2c, 0x041c040c, 0x041c043e, 0x041c0c04, 0x041c0c14, 0x041c142c,
+    0x041c3e04, 0x04240c1c, 0x04241c3e, 0x04242424, 0x04242c3e, 0x04243e1c, 0x04243e2c, 0x042c040c,
+    0x042c043e, 0x042c1c14, 0x042c2c14, 0x04341c2c, 0x04343424, 0x043e0c04, 0x043e0c24, 0x043e0c34,
+    0x043e241c, 0x043e340c, 0x0c04040c, 0x0c04041c, 0x0c040c04, 0x0c040c14, 0x0c04140c, 0x0c04141c,
+    0x0c041c04, 0x0c041c14, 0x0c041c24, 0x0c04243e, 0x0c042c04, 0x0c0c0404, 0x0c0c0414, 0x0c0c0c0c,
+    0x0c0c1404, 0x0c0c1414, 0x0c14040c, 0x0c14041c, 0x0c140c04, 0x0c140c14, 0x0c14140c, 0x0c141c04,
+    0x0c143e14, 0x0c1c0404, 0x0c1c0414, 0x0c1c1404, 0x0c1c1c0c, 0x0c1c2434, 0x0c1c3434, 0x0c24040c,
+    0x0c24042c, 0x0c242c04, 0x0c2c1404, 0x0c2c1424, 0x0c2c2434, 0x0c2c3e0c, 0x0c34042c, 0x0c3e1414,
+    0x0c3e2404, 0x14040404, 0x14040414, 0x14040c0c, 0x14040c1c, 0x14041404, 0x14041414, 0x14041434,
+    0x14041c0c, 0x14042414, 0x140c040c, 0x140c041c, 0x140c042c, 0x140c0c04, 0x140c0c14, 0x140c140c,
+    0x140c1c04, 0x140c341c, 0x140c343e, 0x140c3e04, 0x14140404, 0x14140414, 0x14140c0c, 0x14140c3e,
+    0x14141404, 0x14141414, 0x14141c3e, 0x14142404, 0x14142c2c, 0x141c040c, 0x141c0c04, 0x141c0c24,
+    0x141c3e04, 0x141c3e24, 0x14241c2c, 0x14242c1c, 0x142c041c, 0x142c143e, 0x142c240c, 0x142c3e24,
+    0x143e040c, 0x143e041c, 0x143e0c34, 0x143e242c, 0x1c04040c, 0x1c040c04, 0x1c040c14, 0x1c04140c,
+    0x1c04141c, 0x1c042c04, 0x1c04342c, 0x1c043e14, 0x1c0c0404, 0x1c0c0414, 0x1c0c1404, 0x1c0c1c0c,
+    0x1c0c2424, 0x1c0c2434, 0x1c14040c, 0x1c14041c, 0x1c140c04, 0x1c14142c, 0x1c142c14, 0x1c143e14,
+    0x1c1c0c0c, 0x1c1c1c1c, 0x1c241c04, 0x1c24243e, 0x1c243e14, 0x1c2c0404, 0x1c2c0434, 0x1c2c1414,
+    0x1c2c2c2c, 0x1c340c24, 0x1c341c34, 0x1c34341c, 0x1c3e1c1c, 0x1c3e3404, 0x24040424, 0x24040c3e,
+    0x24041c2c, 0x24041c3e, 0x24042c1c, 0x24042c3e, 0x240c3e24, 0x24141404, 0x24141c3e, 0x24142404,
+    0x24143404, 0x24143434, 0x241c043e, 0x241c242c, 0x24240424, 0x24242c0c, 0x24243424, 0x242c142c,
+    0x242c241c, 0x242c3e04, 0x243e042c, 0x243e0c04, 0x243e0c14, 0x243e1c04, 0x2c040c14, 0x2c04240c,
+    0x2c043e04, 0x2c0c0404, 0x2c0c0434, 0x2c0c1434, 0x2c0c2c2c, 0x2c140c24, 0x2c141c14, 0x2c143e14,
+    0x2c1c0414, 0x2c1c2c1c, 0x2c240c04, 0x2c24141c, 0x2c24143e, 0x2c243e14, 0x2c2c0414, 0x2c2c1c0c,
+    0x2c342c04, 0x2c3e1424, 0x2c3e2414, 0x34041424, 0x34042424, 0x34042434, 0x34043424, 0x340c140c,
+    0x340c340c, 0x34140c3e, 0x34143424, 0x341c1c04, 0x341c1c34, 0x34242424, 0x342c042c, 0x342c2c14,
+    0x34341c1c, 0x343e041c, 0x343e140c, 0x3e04041c, 0x3e04042c, 0x3e04043e, 0x3e040c04, 0x3e041c14,
+    0x3e042c14, 0x3e0c1434, 0x3e0c2404, 0x3e140c14, 0x3e14242c, 0x3e142c14, 0x3e1c0404, 0x3e1c0c2c,
+    0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
+];
 
 fn dequant_q6_k(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
     const BLOCK: usize = 210; // 128+64+16+2
@@ -544,5 +682,144 @@ mod q5k_tests {
     #[test]
     fn q5_k_rejeita_tamanho_invalido() {
         assert!(dequant_to_f32(&RAW[..175], GgmlType::Q5_K).is_err());
+    }
+}
+
+#[cfg(test)]
+mod q3k_tests {
+    use super::*;
+
+    // Primeiro superbloco de `token_embd.weight` do Qwen3.8-35B-A3B (APEX-I-MiniPlus), e os
+    // valores do `gguf-py` do llama.cpp para ele — o oráculo do formato.
+    #[rustfmt::skip]
+    const RAW: [u8; 110] = [
+        245, 11, 119, 238, 241, 171, 184, 230, 152, 70, 252, 122, 234, 190, 169, 249, 76, 236, 207, 47,
+        235, 205, 19, 198, 216, 93, 41, 55, 50, 155, 210, 255, 216, 4, 194, 4, 61, 50, 133, 182,
+        63, 241, 192, 51, 47, 70, 126, 156, 119, 2, 68, 4, 56, 41, 172, 0, 3, 76, 116, 208,
+        247, 32, 127, 36, 0, 59, 222, 0, 4, 1, 121, 65, 49, 79, 1, 192, 23, 120, 51, 53,
+        202, 66, 29, 242, 1, 64, 190, 31, 14, 204, 48, 241, 240, 140, 12, 8, 245, 115, 230, 105,
+        182, 196, 14, 65, 37, 213, 33, 254, 220, 141,
+    ];
+
+    const SPOTS: [(usize, f32); 24] = [
+        (0, 0.0),
+        (1, 0.0),
+        (2, 0.007867813),
+        (3, -0.015735626),
+        (4, 0.0039339066),
+        (5, 0.007867813),
+        (6, -0.01180172),
+        (7, -0.007867813),
+        (124, 0.0060796738),
+        (125, -0.0),
+        (126, 0.018239021),
+        (127, -0.0),
+        (128, -0.0),
+        (129, 0.005364418),
+        (130, -0.010728836),
+        (131, 0.021457672),
+        (248, -0.0),
+        (249, 0.0071525574),
+        (250, 0.02861023),
+        (251, 0.0071525574),
+        (252, 0.0071525574),
+        (253, -0.014305115),
+        (254, -0.0),
+        (255, -0.0),
+    ];
+
+    /// Soma dos 256 valores, para detectar erro em posições fora das amostradas.
+    const SOMA: f64 = -0.031828880310058594;
+
+    #[test]
+    fn q3_k_bate_com_o_oraculo_do_llama_cpp() {
+        let got = dequant_to_f32(&RAW, GgmlType::Q3_K).expect("dequant Q3_K");
+        assert_eq!(got.len(), 256, "um superbloco = 256 elementos");
+        for (i, esperado) in SPOTS {
+            assert!(
+                (got[i] - esperado).abs() < 1e-7,
+                "indice {i}: obtido {}, esperado {esperado}",
+                got[i]
+            );
+        }
+        let soma: f64 = got.iter().map(|&v| f64::from(v)).sum();
+        assert!(
+            (soma - SOMA).abs() < 1e-6,
+            "soma dos 256 valores: obtida {soma:.9e}, esperada {SOMA:.9e}"
+        );
+    }
+
+    #[test]
+    fn q3_k_rejeita_tamanho_invalido() {
+        assert!(dequant_to_f32(&RAW[..RAW.len() - 1], GgmlType::Q3_K).is_err());
+    }
+}
+
+#[cfg(test)]
+mod iq3xxs_tests {
+    use super::*;
+
+    // Primeiro superbloco de `blk.10.ffn_down_exps.weight` do Qwen3.8-35B-A3B (APEX-I-MiniPlus), e os
+    // valores do `gguf-py` do llama.cpp para ele — o oráculo do formato.
+    #[rustfmt::skip]
+    const RAW: [u8; 98] = [
+        196, 4, 38, 121, 13, 134, 107, 81, 84, 148, 70, 110, 119, 196, 56, 63, 185, 128, 7, 199,
+        27, 73, 148, 201, 60, 106, 248, 210, 151, 223, 156, 47, 47, 98, 132, 18, 47, 89, 246, 83,
+        71, 109, 200, 109, 144, 195, 47, 13, 31, 247, 100, 130, 176, 147, 109, 243, 31, 182, 49, 47,
+        52, 239, 199, 158, 123, 174, 102, 58, 22, 242, 97, 177, 42, 145, 183, 187, 223, 221, 206, 206,
+        57, 174, 4, 130, 57, 241, 111, 73, 148, 121, 244, 137, 172, 150, 169, 111, 220, 154,
+    ];
+
+    const SPOTS: [(usize, f32); 24] = [
+        (0, 0.011271238),
+        (1, -0.006762743),
+        (2, -0.015779734),
+        (3, 0.0022542477),
+        (4, 0.011271238),
+        (5, -0.011271238),
+        (6, -0.011271238),
+        (7, 0.011271238),
+        (124, -0.007635355),
+        (125, -0.001527071),
+        (126, -0.001527071),
+        (127, 0.007635355),
+        (128, 0.015779734),
+        (129, 0.0022542477),
+        (130, -0.024796724),
+        (131, 0.011271238),
+        (248, 0.0013816357),
+        (249, -0.012434721),
+        (250, -0.0069081783),
+        (251, 0.0069081783),
+        (252, -0.012434721),
+        (253, 0.0013816357),
+        (254, -0.0013816357),
+        (255, 0.012434721),
+    ];
+
+    /// Soma dos 256 valores, para detectar erro em posições fora das amostradas.
+    const SOMA: f64 = -0.0716632604598999;
+
+    #[test]
+    fn iq3_xxs_bate_com_o_oraculo_do_llama_cpp() {
+        let got = dequant_to_f32(&RAW, GgmlType::IQ3_XXS).expect("dequant IQ3_XXS");
+        assert_eq!(got.len(), 256, "um superbloco = 256 elementos");
+        for (i, esperado) in SPOTS {
+            assert!(
+                (got[i] - esperado).abs() < 1e-7,
+                "indice {i}: obtido {}, esperado {esperado}",
+                got[i]
+            );
+        }
+        let soma: f64 = got.iter().map(|&v| f64::from(v)).sum();
+        assert!(
+            (soma - SOMA).abs() < 1e-6,
+            "soma dos 256 valores: obtida {soma:.9e}, esperada {SOMA:.9e}"
+        );
+    }
+
+    #[test]
+    fn iq3_xxs_rejeita_tamanho_invalido() {
+        assert!(dequant_to_f32(&RAW[..RAW.len() - 1], GgmlType::IQ3_XXS).is_err());
     }
 }
