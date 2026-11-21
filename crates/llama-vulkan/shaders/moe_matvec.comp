@@ -14,10 +14,11 @@
 // denso. `col(s)` é `s / n_usados` no gate/up (os 8 experts do token leem a mesma entrada) e
 // `s` no down (cada slot tem a sua, saída do SwiGLU do próprio expert).
 //
-// O peso é o tensor 3D inteiro, `[n_expert][n_out][n_in]`, com os blocos alinhados em 112
-// bytes (7 uvec4) nos dois tipos:
+// O peso é o tensor 3D inteiro, `[n_expert][n_out][n_in]`; o Q3_K e o IQ3_XXS com os blocos
+// alinhados em 112 bytes (7 uvec4):
 //
 // - TIPO 0, Q3_K: o mesmo layout e a mesma conta do `q3_k_matvec.comp`.
+// - TIPO 2, Q5_K, e TIPO 3, Q6_K: nos layouts do upload, lidos por `desempacotar_k`.
 // - TIPO 1, IQ3_XXS: reempacotado no upload para
 //     uvec4 0..3 : qs[64] — índices na grade, 8 por sub-bloco de 32
 //     uvec4 4..5 : uma palavra por sub-bloco: escala nos 4 bits altos, 4 índices de sinal de 7
@@ -97,6 +98,77 @@ uint byte_de(uvec4 v, uint i) {
 
 uint palavra(uvec4 v, uint i) {
     return i == 0u ? v.x : (i == 1u ? v.y : (i == 2u ? v.z : v.w));
+}
+
+// Q5_K (TIPO 2) e Q6_K (TIPO 3) usam os layouts do upload: o Q5_K cru, 176 B = 11 uvec4; o
+// Q6_K em 212 B (53 uints, ver `pad_q6_k_into`), que não fecha em uvec4 — daí esta visão
+// em uint do mesmo binding.
+layout(set = 0, binding = 0) readonly buffer WeightU { uint w[]; } weight_u;
+
+// v em 0..63 por byte vira v - 32 em int8, sem empréstimo entre bytes.
+uint menos32(uint v) {
+    return ((v | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
+}
+
+// Escala e mínimo de 6 bits do sub-bloco `j` do Q5_K; `scales[i]` é o byte 4 + i de `hdr`.
+void escala_min_q5(uvec4 hdr, uint j, out uint sc, out uint m) {
+    if (j < 4u) {
+        sc = byte_de(hdr, 4u + j) & 63u;
+        m = byte_de(hdr, 8u + j) & 63u;
+    } else {
+        uint a = byte_de(hdr, 8u + j);
+        sc = (a & 0xFu) | ((byte_de(hdr, j) >> 6u) << 4u);
+        m = (a >> 4u) | ((byte_de(hdr, 4u + j) >> 6u) << 4u);
+    }
+}
+
+// Q5_K e Q6_K: os 32 int8 do sub-bloco `j` do superbloco `isb` (índice global,
+// `(expert * n_out + linha) * n_sb + sb`) e as escalas das metades de 16. O sub-bloco vale
+// `s0 * dot(w[0..4], xa) + s1 * dot(w[4..8], xb) - mn * soma(x)`; `mn` só não é zero no Q5_K.
+// Mesma ordem de elementos de `q5_k_matvec.comp` e `q6_k_matvec.comp`.
+void desempacotar_k(uint isb, uint j, out int w[8], out float s0, out float s1, out float mn) {
+    if (TIPO == 2u) {
+        uint b4 = isb * 11u;
+        uvec4 hdr = weight_buf.w4[b4];
+        vec2 dm = unpackHalf2x16(hdr.x);
+        uint sc;
+        uint m;
+        escala_min_q5(hdr, j, sc, m);
+        uvec4 qh0 = weight_buf.w4[b4 + 1u];
+        uvec4 qh1 = weight_buf.w4[b4 + 2u];
+        uvec4 qs0 = weight_buf.w4[b4 + 3u + (j >> 1u) * 2u];
+        uvec4 qs1 = weight_buf.w4[b4 + 4u + (j >> 1u) * 2u];
+        uint sh = 4u * (j & 1u);
+        for (uint k = 0u; k < 4u; k++) {
+            w[k] = int(((palavra(qs0, k) >> sh) & 0x0F0F0F0Fu)
+                       | (((palavra(qh0, k) >> j) & 0x01010101u) << 4u));
+            w[k + 4u] = int(((palavra(qs1, k) >> sh) & 0x0F0F0F0Fu)
+                            | (((palavra(qh1, k) >> j) & 0x01010101u) << 4u));
+        }
+        s0 = dm.x * float(sc);
+        s1 = s0;
+        mn = dm.y * float(m);
+    } else {
+        // Metade de 128 elementos `j / 4`, quarto `j % 4`: ql escolhe o nibble, qh o par
+        // de bits — o laço `l`, `l + 32`, `l + 64`, `l + 96` do ggml.
+        uint bu = isb * 53u;
+        uint quarto = j & 3u;
+        uint ql = bu + (j >> 2u) * 16u + (quarto & 1u) * 8u;
+        uint qh = bu + 32u + (j >> 2u) * 8u;
+        uint sh_l = quarto >= 2u ? 4u : 0u;
+        for (uint k = 0u; k < 8u; k++) {
+            uint v = ((weight_u.w[ql + k] >> sh_l) & 0x0F0F0F0Fu)
+                   | (((weight_u.w[qh + k] >> (2u * quarto)) & 0x03030303u) << 4u);
+            w[k] = int(menos32(v));
+        }
+        float d = unpackHalf2x16(weight_u.w[bu + 52u]).x;
+        // scales[2j] e scales[2j + 1], i8, nos bytes 192 + 2j.
+        uint esc = weight_u.w[bu + 48u + (j >> 1u)];
+        uint o = 16u * (j & 1u);
+        s0 = d * float(int(esc << (24u - o)) >> 24);
+        s1 = d * float(int(esc << (16u - o)) >> 24);
+        mn = 0.0;
+    }
 }
 
 int escala_q3(uvec4 sc, uint is) {
@@ -200,7 +272,7 @@ void main() {
                 int d1 = dot_meia(q1, h1, sh_q, sh_h, xb) - 4 * soma4(xb);
                 acc[r] += xdv * d * (float(escala_q3(sc, 2u * j)) * float(d0)
                                    + float(escala_q3(sc, 2u * j + 1u)) * float(d1));
-            } else {
+            } else if (TIPO == 1u) {
                 uvec4 qv = weight_buf.w4[b4 + (j >> 1u)];
                 uint qw0 = palavra(qv, (j & 1u) * 2u);
                 uint qw1 = palavra(qv, (j & 1u) * 2u + 1u);
@@ -220,6 +292,27 @@ void main() {
                     s += dot_iq3(qi1, qi2, sinais, x1, x2);
                 }
                 acc[r] += xdv * db * float(s);
+            } else {
+                int w[8];
+                float s0;
+                float s1;
+                float mn;
+                desempacotar_k((expert * pc.n_out + row) * n_sb + sb, j, w, s0, s1, mn);
+                int d0 = 0;
+                d0 = dotPacked4x8AccSatEXT(w[0], xa.x, d0);
+                d0 = dotPacked4x8AccSatEXT(w[1], xa.y, d0);
+                d0 = dotPacked4x8AccSatEXT(w[2], xa.z, d0);
+                d0 = dotPacked4x8AccSatEXT(w[3], xa.w, d0);
+                int d1 = 0;
+                d1 = dotPacked4x8AccSatEXT(w[4], xb.x, d1);
+                d1 = dotPacked4x8AccSatEXT(w[5], xb.y, d1);
+                d1 = dotPacked4x8AccSatEXT(w[6], xb.z, d1);
+                d1 = dotPacked4x8AccSatEXT(w[7], xb.w, d1);
+                float t = s0 * float(d0) + s1 * float(d1);
+                if (TIPO == 2u) {
+                    t -= mn * float(soma4(xa) + soma4(xb));
+                }
+                acc[r] += xdv * t;
             }
         }
     }

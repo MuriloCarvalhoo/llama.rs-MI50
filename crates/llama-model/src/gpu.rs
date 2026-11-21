@@ -255,7 +255,9 @@ impl<'a> GpuRawWeights<'a> {
         // A regra `eh_linear` **não** vale aqui: no Qwen3.8-27B o bloco é o 64, que por
         // `(64 + 1) % 4 != 0` cairia como linear, mas o GGUF traz `attn_q/k/v/output` —
         // o bloco MTP é de atenção mesmo nas posições que seriam de atenção linear.
-        let mtp = if cfg.n_layer_nextn > 0 {
+        // shortcut: o bloco MTP do MoE (qwen35moe) tem experts e só o MTP denso está
+        // implementado; ele fica de fora e o servidor segue sem MTP.
+        let mtp = if cfg.n_layer_nextn > 0 && cfg.moe.is_none() {
             let l = cfg.n_layer;
             let p = |s: &str| format!("blk.{l}.{s}");
             let q_out = if cfg.delta_net.is_some() {
@@ -631,7 +633,9 @@ impl<'a> GpuAuxWeights<'a> {
             .collect();
 
         // Auxiliares do bloco MTP — ver `MtpRaw` para o porquê de ele ser sempre de atenção.
-        let mtp = if cfg.n_layer_nextn > 0 {
+        // shortcut: o bloco MTP do MoE (qwen35moe) tem experts e só o MTP denso está
+        // implementado; ele fica de fora e o servidor segue sem MTP.
+        let mtp = if cfg.n_layer_nextn > 0 && cfg.moe.is_none() {
             let l = cfg.n_layer;
             let p = |s: &str| format!("blk.{l}.{s}");
             let dn = cfg.delta_net.as_ref();

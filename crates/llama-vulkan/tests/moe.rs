@@ -1,5 +1,6 @@
 //! Kernels do MoE do qwen35moe contra a referência de CPU (`ggml_cpu::dequant_to_f32`, que
-//! bate bit a bit com o gguf-py): Q3_K denso e o matvec dos experts em Q3_K e IQ3_XXS.
+//! bate bit a bit com o gguf-py): Q3_K denso e o matvec dos experts em Q3_K, IQ3_XXS, Q5_K
+//! e Q6_K.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use gguf::GgmlType;
@@ -29,6 +30,12 @@ fn pesos(ty: GgmlType, n_blocos: usize) -> Vec<u8> {
         let o = b * bloco;
         match ty {
             GgmlType::Q3_K => w[o + 108..o + 110].copy_from_slice(&d),
+            GgmlType::Q6_K => w[o + 208..o + 210].copy_from_slice(&d),
+            // `dmin` aleatório viraria NaN/inf em f16.
+            GgmlType::Q5_K => {
+                w[o..o + 2].copy_from_slice(&d);
+                w[o + 2..o + 4].copy_from_slice(&d);
+            }
             _ => w[o..o + 2].copy_from_slice(&d),
         }
     }
@@ -134,6 +141,14 @@ fn moe_caso(ty: GgmlType, x_por_slot: bool) {
 fn moe_q3_k_bate_com_a_cpu() {
     moe_caso(GgmlType::Q3_K, false);
     moe_caso(GgmlType::Q3_K, true);
+}
+
+#[test]
+fn moe_q5_k_e_q6_k_batem_com_a_cpu() {
+    for ty in [GgmlType::Q5_K, GgmlType::Q6_K] {
+        moe_caso(ty, false);
+        moe_caso(ty, true);
+    }
 }
 
 #[test]
@@ -274,6 +289,14 @@ fn moe_agrupado_caso(ty: GgmlType, x_por_slot: bool) {
 fn moe_agrupado_q3_k_bate_com_a_cpu() {
     moe_agrupado_caso(GgmlType::Q3_K, false);
     moe_agrupado_caso(GgmlType::Q3_K, true);
+}
+
+#[test]
+fn moe_agrupado_q5_k_e_q6_k_batem_com_a_cpu() {
+    for ty in [GgmlType::Q5_K, GgmlType::Q6_K] {
+        moe_agrupado_caso(ty, false);
+        moe_agrupado_caso(ty, true);
+    }
 }
 
 #[test]

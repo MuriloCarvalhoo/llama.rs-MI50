@@ -701,9 +701,11 @@ pub(crate) enum PipeId {
     MatvecQ3K,
     MatvecQ3KB,
     MatvecQ3KV,
-    /// Matvec dos experts escolhidos (`moe_matvec.comp`), Q3_K e IQ3_XXS.
+    /// Matvec dos experts escolhidos (`moe_matvec.comp`), Q3_K, IQ3_XXS, Q5_K e Q6_K.
     MoeQ3K,
     MoeIq3,
+    MoeQ5K,
+    MoeQ6K,
     MoeRouter,
     MoeTopk,
     MoeCombine,
@@ -711,6 +713,8 @@ pub(crate) enum PipeId {
     /// Experts agrupados por expert no prefill (`moe_agrupado.comp`).
     MoeAgrupadoQ3K,
     MoeAgrupadoIq3,
+    MoeAgrupadoQ5K,
+    MoeAgrupadoQ6K,
 }
 
 impl PipeId {
@@ -755,12 +759,16 @@ impl PipeId {
             PipeId::MatvecQ3KV => "matvec_q3k_v",
             PipeId::MoeQ3K => "moe_q3k",
             PipeId::MoeIq3 => "moe_iq3",
+            PipeId::MoeQ5K => "moe_q5k",
+            PipeId::MoeQ6K => "moe_q6k",
             PipeId::MoeRouter => "moe_router",
             PipeId::MoeTopk => "moe_topk",
             PipeId::MoeCombine => "moe_combine",
             PipeId::MoeContar => "moe_contar",
             PipeId::MoeAgrupadoQ3K => "moe_agrupado_q3k",
             PipeId::MoeAgrupadoIq3 => "moe_agrupado_iq3",
+            PipeId::MoeAgrupadoQ5K => "moe_agrupado_q5k",
+            PipeId::MoeAgrupadoQ6K => "moe_agrupado_q6k",
         }
     }
 
@@ -798,9 +806,13 @@ impl PipeId {
             // weight, xq, xd, ids → out
             | PipeId::MoeQ3K
             | PipeId::MoeIq3
+            | PipeId::MoeQ5K
+            | PipeId::MoeQ6K
             // weight, xq, xd, mapa → out
             | PipeId::MoeAgrupadoQ3K
-            | PipeId::MoeAgrupadoIq3 => (&[0, 1, 2, 4], &[3]),
+            | PipeId::MoeAgrupadoIq3
+            | PipeId::MoeAgrupadoQ5K
+            | PipeId::MoeAgrupadoQ6K => (&[0, 1, 2, 4], &[3]),
             PipeId::MoeContar => (&[0], &[1]),
             PipeId::MoeRouter => (&[0, 1], &[2]),
             PipeId::MoeTopk => (&[0], &[1, 2]),
@@ -1253,12 +1265,16 @@ pub struct ResidentForward<'ctx> {
     pub(crate) matvec_q3k_v: ComputePipeline,
     pub(crate) moe_q3k: ComputePipeline,
     pub(crate) moe_iq3: ComputePipeline,
+    pub(crate) moe_q5k: ComputePipeline,
+    pub(crate) moe_q6k: ComputePipeline,
     pub(crate) moe_router: ComputePipeline,
     pub(crate) moe_topk: ComputePipeline,
     pub(crate) moe_combine: ComputePipeline,
     pub(crate) moe_contar: ComputePipeline,
     pub(crate) moe_agrupado_q3k: ComputePipeline,
     pub(crate) moe_agrupado_iq3: ComputePipeline,
+    pub(crate) moe_agrupado_q5k: ComputePipeline,
+    pub(crate) moe_agrupado_q6k: ComputePipeline,
     pub(crate) desc_pool: vk::DescriptorPool,
     pub(crate) state: Option<ResidentState<'ctx>>,
     /// Clock fixo enquanto houver geração (ver `pstate.rs`). Só no backend carregado.
@@ -1598,6 +1614,8 @@ impl<'ctx> ResidentForward<'ctx> {
         // Experts: (peso, xq, xd, saída, ids) + n_in, n_out, n_usados, x_por_slot.
         let moe_q3k = ComputePipeline::with(d, crate::MOE_MATVEC_SPV, 5, 16, &[(0, 0)])?;
         let moe_iq3 = ComputePipeline::with(d, crate::MOE_MATVEC_SPV, 5, 16, &[(0, 1)])?;
+        let moe_q5k = ComputePipeline::with(d, crate::MOE_MATVEC_SPV, 5, 16, &[(0, 2)])?;
+        let moe_q6k = ComputePipeline::with(d, crate::MOE_MATVEC_SPV, 5, 16, &[(0, 3)])?;
         // (peso, x, logits) + n_in, n_linhas; (logits, ids, w) + n_expert, n_usados;
         // (f inout, y, w) + n_embd, n_usados.
         let moe_router = ComputePipeline::with(d, crate::MOE_ROUTER_SPV, 3, 12, &[])?;
@@ -1609,6 +1627,10 @@ impl<'ctx> ResidentForward<'ctx> {
             ComputePipeline::with(d, crate::MOE_AGRUPADO_SPV, 5, push_mv, &[(0, 0)])?;
         let moe_agrupado_iq3 =
             ComputePipeline::with(d, crate::MOE_AGRUPADO_SPV, 5, push_mv, &[(0, 1)])?;
+        let moe_agrupado_q5k =
+            ComputePipeline::with(d, crate::MOE_AGRUPADO_SPV, 5, push_mv, &[(0, 2)])?;
+        let moe_agrupado_q6k =
+            ComputePipeline::with(d, crate::MOE_AGRUPADO_SPV, 5, push_mv, &[(0, 3)])?;
 
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -1671,12 +1693,16 @@ impl<'ctx> ResidentForward<'ctx> {
             matvec_q3k_v,
             moe_q3k,
             moe_iq3,
+            moe_q5k,
+            moe_q6k,
             moe_router,
             moe_topk,
             moe_combine,
             moe_contar,
             moe_agrupado_q3k,
             moe_agrupado_iq3,
+            moe_agrupado_q5k,
+            moe_agrupado_q6k,
             desc_pool,
             state: None,
             pstate: None,
@@ -4114,12 +4140,16 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::MatvecQ3KV => &self.matvec_q3k_v,
             PipeId::MoeQ3K => &self.moe_q3k,
             PipeId::MoeIq3 => &self.moe_iq3,
+            PipeId::MoeQ5K => &self.moe_q5k,
+            PipeId::MoeQ6K => &self.moe_q6k,
             PipeId::MoeRouter => &self.moe_router,
             PipeId::MoeTopk => &self.moe_topk,
             PipeId::MoeCombine => &self.moe_combine,
             PipeId::MoeContar => &self.moe_contar,
             PipeId::MoeAgrupadoQ3K => &self.moe_agrupado_q3k,
             PipeId::MoeAgrupadoIq3 => &self.moe_agrupado_iq3,
+            PipeId::MoeAgrupadoQ5K => &self.moe_agrupado_q5k,
+            PipeId::MoeAgrupadoQ6K => &self.moe_agrupado_q6k,
         }
     }
 
@@ -4927,6 +4957,8 @@ impl<'ctx> ResidentForward<'ctx> {
             let pipe = match w.ty {
                 gguf::GgmlType::Q3_K => PipeId::MoeQ3K,
                 gguf::GgmlType::IQ3_XXS => PipeId::MoeIq3,
+                gguf::GgmlType::Q5_K => PipeId::MoeQ5K,
+                gguf::GgmlType::Q6_K => PipeId::MoeQ6K,
                 outro => {
                     eprintln!("[plano] experts {outro:?} não têm matvec na GPU");
                     return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
@@ -5002,6 +5034,8 @@ impl<'ctx> ResidentForward<'ctx> {
             let pipe = match w.ty {
                 gguf::GgmlType::Q3_K => PipeId::MoeAgrupadoQ3K,
                 gguf::GgmlType::IQ3_XXS => PipeId::MoeAgrupadoIq3,
+                gguf::GgmlType::Q5_K => PipeId::MoeAgrupadoQ5K,
+                gguf::GgmlType::Q6_K => PipeId::MoeAgrupadoQ6K,
                 outro => {
                     eprintln!("[plano] experts {outro:?} não têm kernel agrupado na GPU");
                     return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));

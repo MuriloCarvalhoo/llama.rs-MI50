@@ -360,8 +360,28 @@ pub fn dispatch_q3_k_matvec(
     )
 }
 
+/// `TIPO` dos shaders de MoE para o tipo dos experts.
+fn tipo_moe(ty: gguf::GgmlType) -> Result<u32, MatmulError> {
+    match ty {
+        gguf::GgmlType::Q3_K => Ok(0),
+        gguf::GgmlType::IQ3_XXS => Ok(1),
+        gguf::GgmlType::Q5_K => Ok(2),
+        gguf::GgmlType::Q6_K => Ok(3),
+        _ => Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT)),
+    }
+}
+
+/// O tensor dos experts no layout da VRAM — o mesmo que o upload do modelo produz.
+fn layout_moe(ty: gguf::GgmlType, w_bytes: &[u8]) -> Result<Vec<u8>, MatmulError> {
+    let (bloco, na_vram) = crate::tensor::layout_de(ty)
+        .ok_or(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT))?;
+    let mut alinhado = vec![0u8; w_bytes.len() / bloco * na_vram];
+    crate::tensor::transformar(ty, w_bytes, &mut alinhado);
+    Ok(alinhado)
+}
+
 /// Matvec dos experts (`moe_matvec.comp`): `w_bytes` é o tensor 3D como está no GGUF
-/// (Q3_K ou IQ3_XXS), `x_f32` traz uma ativação por coluna e `ids` o expert de cada slot.
+/// (Q3_K, IQ3_XXS, Q5_K ou Q6_K), `x_f32` traz uma ativação por coluna e `ids` o expert de cada slot.
 /// A saída tem um bloco de `n_out` por slot.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_moe_matvec(
@@ -377,17 +397,8 @@ pub fn dispatch_moe_matvec(
     n_usados: usize,
     x_por_slot: bool,
 ) -> Result<Vec<f32>, MatmulError> {
-    let (tipo, bloco) = match ty {
-        gguf::GgmlType::Q3_K => (0, 110),
-        gguf::GgmlType::IQ3_XXS => (1, 98),
-        _ => return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT)),
-    };
-    let mut alinhado = vec![0u8; w_bytes.len() / bloco * 112];
-    if tipo == 0 {
-        crate::tensor::pad_q3_k_into(w_bytes, &mut alinhado);
-    } else {
-        crate::tensor::repack_iq3_xxs_into(w_bytes, &mut alinhado);
-    }
+    let alinhado = layout_moe(ty, w_bytes)?;
+    let tipo = tipo_moe(ty)?;
     let u = |v: usize| u32::try_from(v).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN));
     dispatch_k_matvec_ext(
         ctx,
@@ -687,17 +698,8 @@ pub fn dispatch_moe_agrupado(
     n_usados: usize,
     x_por_slot: bool,
 ) -> Result<Vec<f32>, MatmulError> {
-    let (tipo, bloco) = match ty {
-        gguf::GgmlType::Q3_K => (0, 110),
-        gguf::GgmlType::IQ3_XXS => (1, 98),
-        _ => return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT)),
-    };
-    let mut alinhado = vec![0u8; w_bytes.len() / bloco * 112];
-    if tipo == 0 {
-        crate::tensor::pad_q3_k_into(w_bytes, &mut alinhado);
-    } else {
-        crate::tensor::repack_iq3_xxs_into(w_bytes, &mut alinhado);
-    }
+    let alinhado = layout_moe(ty, w_bytes)?;
+    let tipo = tipo_moe(ty)?;
     let u = |v: usize| u32::try_from(v).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN));
     dispatch_k_matvec_ext(
         ctx,

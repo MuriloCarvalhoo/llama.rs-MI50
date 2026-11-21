@@ -410,7 +410,7 @@ pub const STAGING_BYTES: vk::DeviceSize = 256 * 1024 * 1024;
 /// - **Q8_0**: 34 → 36 (`escala | pad | 32 qs`), para o shader ler `uint` alinhado.
 /// - **Q6_K**: 210 → 212, pelo mesmo motivo.
 /// - **Q5_K / Q4_K**: crus — 176 B são 44 uints e 144 B são 36 uints, já alinhados.
-fn layout_de(ty: gguf::GgmlType) -> Option<(usize, usize)> {
+pub(crate) fn layout_de(ty: gguf::GgmlType) -> Option<(usize, usize)> {
     match ty {
         gguf::GgmlType::Q8_0 => Some((34, 36)),
         gguf::GgmlType::Q6_K => Some((210, 212)),
@@ -423,7 +423,7 @@ fn layout_de(ty: gguf::GgmlType) -> Option<(usize, usize)> {
 }
 
 /// Escreve os blocos de `src` em `dst` no layout que o shader do tipo espera.
-fn transformar(ty: gguf::GgmlType, src: &[u8], dst: &mut [u8]) {
+pub(crate) fn transformar(ty: gguf::GgmlType, src: &[u8], dst: &mut [u8]) {
     match ty {
         gguf::GgmlType::Q8_0 => repack_q8_0_into(src, dst),
         gguf::GgmlType::Q6_K => pad_q6_k_into(src, dst),

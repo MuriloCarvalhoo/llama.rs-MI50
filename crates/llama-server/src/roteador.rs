@@ -23,6 +23,8 @@ pub struct Preset {
     pub nome: String,
     pub args: Vec<String>,
     pub carregar_ao_iniciar: bool,
+    /// `split = N`: corte do layer-split (`LLAMA_RS_SPLIT`) só neste filho.
+    pub split: Option<String>,
 }
 
 /// Chave do INI → flag do filho, e se é booleana. As abreviações são as do llama.cpp.
@@ -34,6 +36,7 @@ fn flag_do_filho(chave: &str) -> Option<(&'static str, bool)> {
         "gpu-layer-split" => Some(("--gpu-layer-split", true)),
         "mtp" => Some(("--mtp", true)),
         "load-on-startup" => Some(("load-on-startup", true)),
+        "split" => Some(("split", false)),
         _ => None,
     }
 }
@@ -97,9 +100,12 @@ pub fn ler_presets(texto: &str) -> Result<Vec<Preset>, String> {
             }
             let mut args = Vec::new();
             let mut carregar_ao_iniciar = false;
+            let mut split = None;
             for ((flag, booleana), valor) in opcoes {
                 if flag == "load-on-startup" {
                     carregar_ao_iniciar = verdadeiro(&valor);
+                } else if flag == "split" {
+                    split = Some(valor);
                 } else if !booleana {
                     args.extend([flag.to_owned(), valor]);
                 } else if verdadeiro(&valor) {
@@ -110,6 +116,7 @@ pub fn ler_presets(texto: &str) -> Result<Vec<Preset>, String> {
                 nome,
                 args,
                 carregar_ao_iniciar,
+                split,
             })
         })
         .collect()
@@ -314,12 +321,19 @@ fn subir(preset: &Preset, extra: &[String]) -> Result<(Child, u16), String> {
     // Sem `numactl --interleave=all` o nó 0 estoura ao subir os pesos e a máquina trava.
     let mut com_numa = Command::new("numactl");
     com_numa.arg("--interleave=all").arg(&exe).args(&args);
+    let ambiente: Vec<(&str, &str)> = preset
+        .split
+        .iter()
+        .map(|v| ("LLAMA_RS_SPLIT", v.as_str()))
+        .collect();
+    com_numa.envs(ambiente.iter().copied());
     let mut processo = match com_numa.stdin(Stdio::piped()).spawn() {
         Ok(p) => p,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!("AVISO: numactl não encontrado — sem ele o nó 0 estoura e a máquina trava");
             Command::new(&exe)
                 .args(&args)
+                .envs(ambiente.iter().copied())
                 .stdin(Stdio::piped())
                 .spawn()
                 .map_err(|e| e.to_string())?
@@ -425,6 +439,7 @@ c = 8192
 [qwen-a]
 model = /m/a.gguf
 load-on-startup = true
+split = 19
 n-gpu-layers = 99
 
 [qwen-b]
@@ -440,6 +455,8 @@ gpu-layer-split = false
         assert_eq!(p.len(), 2);
         assert_eq!(p[0].nome, "qwen-a");
         assert!(p[0].carregar_ao_iniciar);
+        assert_eq!(p[0].split.as_deref(), Some("19"));
+        assert_eq!(p[1].split, None);
         assert_eq!(
             p[0].args,
             [
