@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["oracle", "crates/gguf", "crates/llama-tokenizer", "crates/llama-chat", "crates/llama-model", "crates/ggml-cpu", "crates/llama-sampling", "crates/llama-cli", "crates/llama-server", "crates/llama-vulkan"]
+members = ["oracle", "crates/gguf", "crates/llama-tokenizer", "crates/llama-chat", "crates/llama-model", "crates/ggml-cpu", "crates/llama-sampling", "crates/llama-cli", "crates/llama-server", "crates/llama-vulkan", "crates/llama-sys"]
 
 [workspace.package]
 edition = "2024"
@@ -17,6 +17,7 @@ ggml-cpu = { path = "crates/ggml-cpu" }
 rand = "0.10"
 llama-sampling = { path = "crates/llama-sampling" }
 llama-model = { path = "crates/llama-model" }
+llama-sys = { path = "crates/llama-sys" }
 clap = { version = "4", features = ["derive"] }
 regex = "1"
 rayon = "1"

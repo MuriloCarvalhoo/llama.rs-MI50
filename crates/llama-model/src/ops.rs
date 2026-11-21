@@ -1,10 +1,9 @@
 //! Kernels f32 puros do forward Llama. Layout token-major: `x[t*dim + d]`.
 #![allow(clippy::indexing_slicing)]
-// Kernels AVX2 requerem unsafe; permitido apenas neste módulo.
-#![allow(unsafe_code)]
 
 use crate::error::ModelError;
 use rayon::prelude::*;
+use wide::{bytemuck, f32x8};
 
 /// GET_ROWS: para cada token, copia a linha de `embd` ({vocab, n_embd}).
 /// Saída token-major [n_tok * n_embd].
@@ -143,228 +142,94 @@ pub(crate) fn matmul_q8_0(
     out
 }
 
-/// Kernel AVX2 explícito para Q8_0 × f32.
-/// Carrega 32 i8 quants em 4 × _mm256_cvtepi8_epi32 e acumula com VFMADD231PS.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-fn q8_0_dot_avx2(w_row: &[u8], x_row: &[f32], n_blocks: usize) -> f32 {
-    use std::arch::x86_64::*;
-    const B: usize = 34;
-    const Q: usize = 32;
-
-    // SAFETY: intrinsics protegidos por #[target_feature(enable = "avx2,fma")];
-    // caller garante AVX2+FMA disponíveis em runtime (via is_x86_feature_detected!).
-    // Ponteiros gerados a partir de slices válidos com bounds verificados pelo loop.
-    let mut acc = _mm256_setzero_ps();
-
-    for b in 0..n_blocks {
-        let bw = b * B;
-        let d_bits = u16::from_le_bytes([w_row[bw], w_row[bw + 1]]);
-        let d = _mm256_set1_ps(half::f16::from_bits(d_bits).to_f32());
-
-        let qs = unsafe { w_row.as_ptr().add(bw + 2) };
-        let xb = unsafe { x_row.as_ptr().add(b * Q) };
-
-        let q0 = unsafe { _mm256_cvtepi8_epi32(_mm_loadl_epi64(qs as *const __m128i)) };
-        let q1 = unsafe { _mm256_cvtepi8_epi32(_mm_loadl_epi64(qs.add(8) as *const __m128i)) };
-        let q2 = unsafe { _mm256_cvtepi8_epi32(_mm_loadl_epi64(qs.add(16) as *const __m128i)) };
-        let q3 = unsafe { _mm256_cvtepi8_epi32(_mm_loadl_epi64(qs.add(24) as *const __m128i)) };
-
-        let x0 = unsafe { _mm256_loadu_ps(xb) };
-        let x1 = unsafe { _mm256_loadu_ps(xb.add(8)) };
-        let x2 = unsafe { _mm256_loadu_ps(xb.add(16)) };
-        let x3 = unsafe { _mm256_loadu_ps(xb.add(24)) };
-
-        let s0 = _mm256_mul_ps(_mm256_cvtepi32_ps(q0), x0);
-        let s1 = _mm256_mul_ps(_mm256_cvtepi32_ps(q1), x1);
-        let s2 = _mm256_mul_ps(_mm256_cvtepi32_ps(q2), x2);
-        let s3 = _mm256_mul_ps(_mm256_cvtepi32_ps(q3), x3);
-
-        let sum = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
-        acc = _mm256_fmadd_ps(d, sum, acc);
-    }
-
-    hsum_f32_avx(acc)
+/// Escala f16 little-endian de um bloco Q8_0.
+#[inline(always)]
+fn escala(d: [u8; 2]) -> f32 {
+    half::f16::from_bits(u16::from_le_bytes(d)).to_f32()
 }
 
-/// Kernel AVX2 explícito para Q8_0 × Q8_0.
-/// Usa VPMADDUBSW (abs(qw) u8 × signed_qx i8 → i16) + VPMADDWD(×1→i32):
-/// 4 instruções por bloco de 32 elementos vs 7 na abordagem cvtepi8_epi16.
-/// Prova de não-saturação: max par = 128×127+128×127 = 32512 < 32767 (i16 max).
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-fn q8_0_q8_0_dot_avx2(w_row: &[u8], x_q8_row: &[u8], n_blocks: usize) -> f32 {
-    use std::arch::x86_64::*;
-    const B: usize = 34;
-
-    // SAFETY: intrinsics protegidos por #[target_feature]; slices têm n_blocks × 34 bytes.
-    let mut acc = _mm256_setzero_ps();
-    let ones = _mm256_set1_epi16(1);
-
-    for b in 0..n_blocks {
-        let boff = b * B;
-        unsafe {
-            let dw = half::f16::from_bits(u16::from_le_bytes([
-                *w_row.as_ptr().add(boff),
-                *w_row.as_ptr().add(boff + 1),
-            ]))
-            .to_f32();
-            let dx = half::f16::from_bits(u16::from_le_bytes([
-                *x_q8_row.as_ptr().add(boff),
-                *x_q8_row.as_ptr().add(boff + 1),
-            ]))
-            .to_f32();
-
-            let qw = _mm256_loadu_si256(w_row.as_ptr().add(boff + 2) as *const __m256i);
-            let qx = _mm256_loadu_si256(x_q8_row.as_ptr().add(boff + 2) as *const __m256i);
-
-            // abs(qw): i8 → u8; sign(qx, qw): negate qx where qw<0 → qw*qx = abs(qw)*signed_qx
-            let abs_qw = _mm256_abs_epi8(qw);
-            let signed_qx = _mm256_sign_epi8(qx, qw);
-            // maddubs: 32 pares u8×i8 → 16 somas i16; madd(×1): 16 pares i16 → 8 somas i32
-            let sum_i32 = _mm256_madd_epi16(_mm256_maddubs_epi16(abs_qw, signed_qx), ones);
-
-            acc = _mm256_fmadd_ps(_mm256_set1_ps(dw * dx), _mm256_cvtepi32_ps(sum_i32), acc);
-        }
-    }
-
-    hsum_f32_avx(acc)
+/// Separa um bloco Q8_0 (34 bytes) em escala e quants.
+#[inline(always)]
+fn bloco_q8_0(b: &[u8; 34]) -> (f32, &[u8; 32]) {
+    let [d0, d1, qs @ ..] = b;
+    (escala([*d0, *d1]), qs)
 }
 
-/// Redução horizontal: 8 floats AVX → 1 f32.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[inline]
-fn hsum_f32_avx(v: std::arch::x86_64::__m256) -> f32 {
-    use std::arch::x86_64::*;
-    // SAFETY: veja q8_0_dot_avx2.
-    let hi128 = _mm256_extractf128_ps(v, 1);
-    let lo128 = _mm256_castps256_ps128(v);
-    let sum128 = _mm_add_ps(lo128, hi128);
-    let hi64 = _mm_movehl_ps(sum128, sum128);
-    let sum64 = _mm_add_ps(sum128, hi64);
-    let hi32 = _mm_shuffle_ps(sum64, sum64, 0x1);
-    _mm_cvtss_f32(_mm_add_ss(sum64, hi32))
+/// Σ qw·qx dos 32 quants i8 em 8 somas parciais, já em f32. Com AVX2 são as mesmas
+/// instruções do kernel `std::arch` que isto substituiu (`vpabsb`/`vpsignb`/`vpmaddubsw`/
+/// `vpmaddwd`), pela API segura do `safe_arch`. Prova de não-saturação do `vpmaddubsw`:
+/// max par = 128×127+128×127 = 32512 < 32767.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+fn dot_parcial(qw: &[u8; 32], qx: &[u8; 32]) -> f32x8 {
+    use safe_arch::*;
+    let (w, x) = (m256i::from(*qw), m256i::from(*qx));
+    let pares =
+        mul_u8i8_add_horizontal_saturating_m256i(abs_i8_m256i(w), sign_apply_i8_m256i(x, w));
+    let soma = mul_i16_horizontal_add_m256i(pares, set_splat_i16_m256i(1));
+    bytemuck::cast(convert_to_m256_from_i32_m256i(soma))
 }
 
-/// Otimização 1 — produto escalar Q8_0 × f32 com dispatch AVX2/fallback scalar.
+/// Sem AVX2: estende para i16 e usa o `dot` do `wide` (que cai para SSE ou escalar).
+#[cfg(not(target_feature = "avx2"))]
+#[inline(always)]
+fn dot_parcial(qw: &[u8; 32], qx: &[u8; 32]) -> f32x8 {
+    use wide::{i8x16, i16x16};
+    let i16s = |q: &[u8; 32]| -> [i16x16; 2] {
+        let [a, b]: [i8x16; 2] = bytemuck::cast(*q);
+        [i16x16::from_i8x16(a), i16x16::from_i8x16(b)]
+    };
+    let (w, x) = (i16s(qw), i16s(qx));
+    f32x8::from_i32x8(w[0].dot(x[0]) + w[1].dot(x[1]))
+}
+
+/// Produto escalar Q8_0 × f32. Oito acumuladores independentes: soma de f32 não é
+/// associativa, e com um acumulador só o LLVM não vetoriza a redução.
 #[inline]
 fn q8_0_dot(w_row: &[u8], x_row: &[f32], n_blocks: usize) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            // SAFETY: feature detectada em runtime; slices têm tamanho correto (n_blocks × 34 e n_blocks × 32).
-            return unsafe { q8_0_dot_avx2(w_row, x_row, n_blocks) };
+    let mut acc = [0.0f32; 8];
+    let blocos = w_row
+        .as_chunks::<34>()
+        .0
+        .iter()
+        .zip(x_row.as_chunks::<32>().0);
+    for (bw, xb) in blocos.take(n_blocks) {
+        let (d, qs) = bloco_q8_0(bw);
+        for (q8, x8) in qs.as_chunks::<8>().0.iter().zip(xb.as_chunks::<8>().0) {
+            for ((a, &q), &x) in acc.iter_mut().zip(q8).zip(x8) {
+                *a += d * f32::from(q.cast_signed()) * x;
+            }
         }
     }
-    q8_0_dot_scalar(w_row, x_row, n_blocks)
-}
-
-/// Fallback scalar para Q8_0 × f32.
-#[inline]
-fn q8_0_dot_scalar(w_row: &[u8], x_row: &[f32], n_blocks: usize) -> f32 {
-    const Q: usize = 32;
-    const B: usize = 34;
-    let mut acc = 0.0f32;
-    for b in 0..n_blocks {
-        let blk = &w_row[b * B..(b + 1) * B];
-        let d = half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
-        let qs = &blk[2..2 + Q];
-        let xb = &x_row[b * Q..(b + 1) * Q];
-        let mut dot = 0.0f32;
-        for i in 0..Q {
-            dot += f32::from(qs[i].cast_signed()) * xb[i];
-        }
-        acc += d * dot;
-    }
-    acc
-}
-
-/// AVX2: quantiza 32 f32 por bloco via SIMD — ~10× mais rápido que scalar.
-/// Usa packs saturante (i32→i16→i8) + permutevar8x32 para corrigir lane ordering.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn quantize_q8_0_avx2(x: &[f32]) -> Vec<u8> {
-    unsafe {
-        use std::arch::x86_64::*;
-        const Q: usize = 32;
-        const B: usize = 34;
-        let n_blocks = x.len() / Q;
-        let capacity = n_blocks * B;
-        let mut out = Vec::with_capacity(capacity);
-        // abs mask: zera o bit de sinal sem branch
-        let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFFi32));
-        // permutação para corrigir cross-lane ordering após packs: dwords [0,4,1,5,2,6,3,7]
-        let perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
-        let base_ptr: *mut u8 = out.as_mut_ptr();
-        for b in 0..n_blocks {
-            let p = x.as_ptr().add(b * Q);
-            let v0 = _mm256_loadu_ps(p);
-            let v1 = _mm256_loadu_ps(p.add(8));
-            let v2 = _mm256_loadu_ps(p.add(16));
-            let v3 = _mm256_loadu_ps(p.add(24));
-            // max abs via árvore de reduções
-            let max01 = _mm256_max_ps(_mm256_and_ps(v0, abs_mask), _mm256_and_ps(v1, abs_mask));
-            let max23 = _mm256_max_ps(_mm256_and_ps(v2, abs_mask), _mm256_and_ps(v3, abs_mask));
-            let max4 = _mm256_max_ps(max01, max23);
-            let hi = _mm256_extractf128_ps(max4, 1);
-            let lo = _mm256_castps256_ps128(max4);
-            let m = _mm_max_ps(hi, lo);
-            let m = _mm_max_ps(m, _mm_shuffle_ps(m, m, 0x4E)); // swap pairs [2,3,0,1]
-            let m = _mm_max_ps(m, _mm_shuffle_ps(m, m, 0x01)); // lane0 ← max(lane0, lane1)
-            let max_abs = _mm_cvtss_f32(m);
-            // escala
-            let d = if max_abs > 0.0 {
-                max_abs / 127.0_f32
-            } else {
-                0.0_f32
-            };
-            let d_inv = if d > 0.0 { 1.0_f32 / d } else { 0.0_f32 };
-            let d_bits = half::f16::from_f32(d).to_bits().to_le_bytes();
-            // quantiza: multiply + round-to-nearest (MXCSR default) + convert to i32
-            let inv_v = _mm256_set1_ps(d_inv);
-            let q0 = _mm256_cvtps_epi32(_mm256_mul_ps(v0, inv_v));
-            let q1 = _mm256_cvtps_epi32(_mm256_mul_ps(v1, inv_v));
-            let q2 = _mm256_cvtps_epi32(_mm256_mul_ps(v2, inv_v));
-            let q3 = _mm256_cvtps_epi32(_mm256_mul_ps(v3, inv_v));
-            // i32→i16→i8 com saturação; corrige cross-lane com permutevar
-            let q01 = _mm256_packs_epi32(q0, q1);
-            let q23 = _mm256_packs_epi32(q2, q3);
-            let bytes32 = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(q01, q23), perm);
-            // escreve diretamente no buffer pré-alocado
-            let dst = base_ptr.add(b * B);
-            std::ptr::copy_nonoverlapping(d_bits.as_ptr(), dst, 2);
-            _mm256_storeu_si256(dst.add(2) as *mut __m256i, bytes32);
-        }
-        // SAFETY: capacity bytes foram escritos acima
-        out.set_len(capacity);
-        out
-    }
+    acc.iter().sum()
 }
 
 /// Otimização 2a — quantiza um vetor f32 para Q8_0.
 /// Saída: n_in/32 blocos × 34 bytes (2 bytes f16 scale + 32 bytes i8).
 fn quantize_q8_0(x: &[f32]) -> Vec<u8> {
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
-        // SAFETY: feature AVX2 detectada em runtime
-        return unsafe { quantize_q8_0_avx2(x) };
-    }
-    const Q: usize = 32;
-    const B: usize = 34;
-    let n_blocks = x.len() / Q;
-    let mut out = Vec::with_capacity(n_blocks * B);
-    for b in 0..n_blocks {
-        let blk = &x[b * Q..(b + 1) * Q];
-        let max_abs = blk.iter().map(|&v| v.abs()).fold(0.0f32, f32::max);
-        let d = if max_abs > 0.0 { max_abs / 127.0 } else { 0.0 };
-        let d_inv = if d > 0.0 { 1.0 / d } else { 0.0 };
-        out.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
-        for &v in blk {
-            // O clamp acima já prende o valor no intervalo de i8: o cast não trunca.
+    let blocos = x.as_chunks::<32>().0;
+    let mut out = vec![0u8; blocos.len() * 34];
+    for (blk, dst) in blocos.iter().zip(out.as_chunks_mut::<34>().0) {
+        let v: [f32x8; 4] = bytemuck::cast(*blk);
+        let max_abs = v
+            .iter()
+            .fold(f32x8::ZERO, |m, x| m.max(x.abs()))
+            .to_array()
+            .into_iter()
+            .fold(0.0f32, f32::max);
+        let d = max_abs / 127.0;
+        let d_inv = f32x8::splat(if d > 0.0 { 1.0 / d } else { 0.0 });
+        let [d0, d1, qs @ ..] = dst;
+        [*d0, *d1] = half::f16::from_f32(d).to_bits().to_le_bytes();
+        for (q8, x) in qs.as_chunks_mut::<8>().0.iter_mut().zip(v) {
+            // `round_int` é o `cvtps2dq` (ties-even) do kernel AVX2 que esta função
+            // substituiu. |x·d_inv| <= 127 por construção: o cast para i8 não trunca.
             #[allow(clippy::cast_possible_truncation)]
-            let q = (v * d_inv).round().clamp(-128.0, 127.0) as i8;
-            out.push(q.cast_unsigned());
+            let i = (x * d_inv)
+                .round_int()
+                .to_array()
+                .map(|i| (i as i8).cast_unsigned());
+            *q8 = i;
         }
     }
     out
@@ -384,195 +249,22 @@ pub(crate) fn quantize_q8_0_split(x: &[f32], n_in: usize, n_tok: usize) -> Vec<u
     out
 }
 
-/// Otimização 2c — produto escalar Q8_0 × Q8_0 → f32 com dispatch AVX2/fallback scalar.
+/// Otimização 2c — produto escalar Q8_0 × Q8_0 → f32.
 #[inline]
 fn q8_0_q8_0_dot(w_row: &[u8], x_q8_row: &[u8], n_blocks: usize) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            // SAFETY: feature detectada em runtime; slices têm n_blocks × 34 bytes.
-            return unsafe { q8_0_q8_0_dot_avx2(w_row, x_q8_row, n_blocks) };
-        }
-    }
-    q8_0_q8_0_dot_scalar(w_row, x_q8_row, n_blocks)
-}
-
-/// Kernel AVX2 de 4 linhas: processa 4 linhas de saída simultaneamente,
-/// reutilizando qx_lo/qx_hi e dx em todos os 4 pesos — reduz recargas de x 4×.
-///
-/// SAFETY: caller deve garantir AVX2+FMA disponíveis; ponteiros w_ptr e x_ptr devem
-/// apontar para slices válidos com ao menos 4*row_bytes e n_blocks*34 bytes respectivamente.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn q8_0_q8_0_dot_4rows_avx2(
-    w_ptr: *const u8,
-    row_bytes: usize,
-    x_ptr: *const u8,
-    n_blocks: usize,
-) -> [f32; 4] {
-    unsafe {
-        use std::arch::x86_64::*;
-        const B: usize = 34;
-
-        let mut acc0 = _mm256_setzero_ps();
-        let mut acc1 = _mm256_setzero_ps();
-        let mut acc2 = _mm256_setzero_ps();
-        let mut acc3 = _mm256_setzero_ps();
-
-        let w1 = w_ptr.add(row_bytes);
-        let w2 = w_ptr.add(2 * row_bytes);
-        let w3 = w_ptr.add(3 * row_bytes);
-
-        let ones = _mm256_set1_epi16(1);
-        // Pré-busca para esconder latência: o loop tem apenas 28 iterações (n_in=896),
-        // o que é curto demais para o hardware prefetcher aprender o padrão a tempo.
-        const PF: usize = 1; // distância de pré-busca em blocos
-        const PF_BYTES: usize = PF * B;
-
-        for b in 0..n_blocks {
-            let boff = b * B;
-
-            // Software prefetch — carrega dados de w_ptr..w3 no L2 para a iteração b+PF.
-            if boff + PF_BYTES < n_blocks * B {
-                let next = boff + PF_BYTES;
-                _mm_prefetch(w_ptr.add(next) as *const i8, _MM_HINT_T1);
-                _mm_prefetch(w1.add(next) as *const i8, _MM_HINT_T1);
-                _mm_prefetch(w2.add(next) as *const i8, _MM_HINT_T1);
-                _mm_prefetch(w3.add(next) as *const i8, _MM_HINT_T1);
-            }
-
-            // Carrega bloco x uma única vez — dx e qx ficam em registradores para as 4 linhas.
-            let dx =
-                half::f16::from_bits(u16::from_le_bytes([*x_ptr.add(boff), *x_ptr.add(boff + 1)]))
-                    .to_f32();
-            let qx = _mm256_loadu_si256(x_ptr.add(boff + 2) as *const __m256i);
-
-            // Macro maddubs: abs(qw)×sign(qx,qw) → i16 pares → i32; 4 instr. vs 7 (cvtepi8×4+madd×2+add).
-            macro_rules! dot_row {
-                ($acc:ident, $wp:expr) => {{
-                    let dw = half::f16::from_bits(u16::from_le_bytes([
-                        *$wp.add(boff),
-                        *$wp.add(boff + 1),
-                    ]))
-                    .to_f32();
-                    let qw = _mm256_loadu_si256($wp.add(boff + 2) as *const __m256i);
-                    let sum_i32 = _mm256_madd_epi16(
-                        _mm256_maddubs_epi16(_mm256_abs_epi8(qw), _mm256_sign_epi8(qx, qw)),
-                        ones,
-                    );
-                    $acc =
-                        _mm256_fmadd_ps(_mm256_set1_ps(dw * dx), _mm256_cvtepi32_ps(sum_i32), $acc);
-                }};
-            }
-
-            dot_row!(acc0, w_ptr);
-            dot_row!(acc1, w1);
-            dot_row!(acc2, w2);
-            dot_row!(acc3, w3);
-        }
-
-        [
-            hsum_f32_avx(acc0),
-            hsum_f32_avx(acc1),
-            hsum_f32_avx(acc2),
-            hsum_f32_avx(acc3),
-        ]
-    }
-}
-
-/// Kernel 8 linhas com F16C: converte escala f16→f32 em 1 instrução (vs ~10 no software),
-/// e amortiza o carregamento de x em 8 saídas em vez de 4.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn q8_0_q8_0_dot_8rows_avx2_f16c(
-    w_ptr: *const u8,
-    row_bytes: usize,
-    x_ptr: *const u8,
-    n_blocks: usize,
-) -> [f32; 8] {
-    unsafe {
-        use std::arch::x86_64::*;
-        const B: usize = 34;
-
-        let mut acc0 = _mm256_setzero_ps();
-        let mut acc1 = _mm256_setzero_ps();
-        let mut acc2 = _mm256_setzero_ps();
-        let mut acc3 = _mm256_setzero_ps();
-        let mut acc4 = _mm256_setzero_ps();
-        let mut acc5 = _mm256_setzero_ps();
-        let mut acc6 = _mm256_setzero_ps();
-        let mut acc7 = _mm256_setzero_ps();
-
-        let w1 = w_ptr.add(row_bytes);
-        let w2 = w_ptr.add(2 * row_bytes);
-        let w3 = w_ptr.add(3 * row_bytes);
-        let w4 = w_ptr.add(4 * row_bytes);
-        let w5 = w_ptr.add(5 * row_bytes);
-        let w6 = w_ptr.add(6 * row_bytes);
-        let w7 = w_ptr.add(7 * row_bytes);
-
-        let ones = _mm256_set1_epi16(1);
-        const PF: usize = 2;
-        const PF_BYTES: usize = PF * B;
-
-        for b in 0..n_blocks {
-            let boff = b * B;
-            if boff + PF_BYTES < n_blocks * B {
-                let nxt = boff + PF_BYTES;
-                _mm_prefetch(w_ptr.add(nxt) as *const i8, _MM_HINT_T1);
-                _mm_prefetch(w1.add(nxt) as *const i8, _MM_HINT_T1);
-                _mm_prefetch(w2.add(nxt) as *const i8, _MM_HINT_T1);
-                _mm_prefetch(w3.add(nxt) as *const i8, _MM_HINT_T1);
-                _mm_prefetch(w4.add(nxt) as *const i8, _MM_HINT_T1);
-                _mm_prefetch(w5.add(nxt) as *const i8, _MM_HINT_T1);
-                _mm_prefetch(w6.add(nxt) as *const i8, _MM_HINT_T1);
-                _mm_prefetch(w7.add(nxt) as *const i8, _MM_HINT_T1);
-            }
-
-            // F16C: carrega f16 em 1 instrução vcvtph2ps ao invés de ~10 instruções software.
-            macro_rules! f16c {
-                ($p:expr) => {{
-                    let bits = (*($p).add(boff) as i32) | ((*($p).add(boff + 1) as i32) << 8);
-                    _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits)))
-                }};
-            }
-            let dx = f16c!(x_ptr);
-            let qx = _mm256_loadu_si256(x_ptr.add(boff + 2) as *const __m256i);
-
-            macro_rules! dot_row {
-                ($acc:ident, $wp:expr) => {{
-                    let dw = f16c!($wp);
-                    let qw = _mm256_loadu_si256($wp.add(boff + 2) as *const __m256i);
-                    let sum_i32 = _mm256_madd_epi16(
-                        _mm256_maddubs_epi16(_mm256_abs_epi8(qw), _mm256_sign_epi8(qx, qw)),
-                        ones,
-                    );
-                    $acc =
-                        _mm256_fmadd_ps(_mm256_set1_ps(dw * dx), _mm256_cvtepi32_ps(sum_i32), $acc);
-                }};
-            }
-
-            dot_row!(acc0, w_ptr);
-            dot_row!(acc1, w1);
-            dot_row!(acc2, w2);
-            dot_row!(acc3, w3);
-            dot_row!(acc4, w4);
-            dot_row!(acc5, w5);
-            dot_row!(acc6, w6);
-            dot_row!(acc7, w7);
-        }
-
-        [
-            hsum_f32_avx(acc0),
-            hsum_f32_avx(acc1),
-            hsum_f32_avx(acc2),
-            hsum_f32_avx(acc3),
-            hsum_f32_avx(acc4),
-            hsum_f32_avx(acc5),
-            hsum_f32_avx(acc6),
-            hsum_f32_avx(acc7),
-        ]
-    }
+    let blocos = w_row
+        .as_chunks::<34>()
+        .0
+        .iter()
+        .zip(x_q8_row.as_chunks::<34>().0);
+    blocos
+        .take(n_blocks)
+        .fold(f32x8::ZERO, |acc, (bw, bx)| {
+            let (dw, qw) = bloco_q8_0(bw);
+            let (dx, qx) = bloco_q8_0(bx);
+            dot_parcial(qw, qx).mul_add(f32x8::splat(dw * dx), acc)
+        })
+        .reduce_add()
 }
 
 /// Recompacta pesos Q8_0 de row-major para block_q8_0x8.
@@ -612,119 +304,36 @@ pub(crate) fn repack_q8_0_8rows(w: &[u8], n_in: usize, n_out: usize) -> Vec<u8> 
     out
 }
 
-/// Kernel para pesos em block_q8_0x8 + ativações Q8_0 padrão.
-/// packed_ptr aponta para um grupo de 8 linhas em formato repacked:
-///   bloco b @ packed_ptr + b*272 : [d0..d7 (16B f16)] + [qs0[32]..qs7[32] (256B)]
-/// x_ptr aponta para ativações Q8_0 padrão (n_blocks × 34 bytes).
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn q8_0_q8_0_dot_8rows_repacked_f16c(
-    packed_ptr: *const u8,
-    x_ptr: *const u8,
-    n_blocks: usize,
-) -> [f32; 8] {
-    unsafe {
-        use std::arch::x86_64::*;
-        const XB: usize = 34;
-        const PB: usize = 272;
-
-        let mut acc0 = _mm256_setzero_ps();
-        let mut acc1 = _mm256_setzero_ps();
-        let mut acc2 = _mm256_setzero_ps();
-        let mut acc3 = _mm256_setzero_ps();
-        let mut acc4 = _mm256_setzero_ps();
-        let mut acc5 = _mm256_setzero_ps();
-        let mut acc6 = _mm256_setzero_ps();
-        let mut acc7 = _mm256_setzero_ps();
-        let ones = _mm256_set1_epi16(1);
-
-        for b in 0..n_blocks {
-            let boff = b * PB;
-            let x_boff = b * XB;
-            // Prefetch próximo bloco (272 bytes = 4-5 cache lines)
-            if b + 2 < n_blocks {
-                let nxt = (b + 2) * PB;
-                _mm_prefetch(packed_ptr.add(nxt) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(packed_ptr.add(nxt + 64) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(packed_ptr.add(nxt + 128) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(packed_ptr.add(nxt + 192) as *const i8, _MM_HINT_T0);
-            }
-            // Escala x via F16C
-            let dx_bits = (*x_ptr.add(x_boff) as i32) | ((*x_ptr.add(x_boff + 1) as i32) << 8);
-            let dx = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(dx_bits)));
-            let qx = _mm256_loadu_si256(x_ptr.add(x_boff + 2) as *const __m256i);
-            // Carrega 8 escalas f16 em 1 load de 128 bits → 2 × _mm_cvtph_ps
-            let sc128 = _mm_loadu_si128(packed_ptr.add(boff) as *const __m128i);
-            let dw_lo = _mm_cvtph_ps(sc128);
-            let dw_hi = _mm_cvtph_ps(_mm_srli_si128(sc128, 8));
-            let d0 = _mm_cvtss_f32(dw_lo);
-            let d1 = _mm_cvtss_f32(_mm_shuffle_ps(dw_lo, dw_lo, 0x55));
-            let d2 = _mm_cvtss_f32(_mm_shuffle_ps(dw_lo, dw_lo, 0xAA));
-            let d3 = _mm_cvtss_f32(_mm_shuffle_ps(dw_lo, dw_lo, 0xFF));
-            let d4 = _mm_cvtss_f32(dw_hi);
-            let d5 = _mm_cvtss_f32(_mm_shuffle_ps(dw_hi, dw_hi, 0x55));
-            let d6 = _mm_cvtss_f32(_mm_shuffle_ps(dw_hi, dw_hi, 0xAA));
-            let d7 = _mm_cvtss_f32(_mm_shuffle_ps(dw_hi, dw_hi, 0xFF));
-            macro_rules! dot_row {
-                ($acc:ident, $j:expr, $d:expr) => {{
-                    let qw =
-                        _mm256_loadu_si256(packed_ptr.add(boff + 16 + $j * 32) as *const __m256i);
-                    let sum_i32 = _mm256_madd_epi16(
-                        _mm256_maddubs_epi16(_mm256_abs_epi8(qw), _mm256_sign_epi8(qx, qw)),
-                        ones,
-                    );
-                    $acc =
-                        _mm256_fmadd_ps(_mm256_set1_ps($d * dx), _mm256_cvtepi32_ps(sum_i32), $acc);
-                }};
-            }
-            dot_row!(acc0, 0, d0);
-            dot_row!(acc1, 1, d1);
-            dot_row!(acc2, 2, d2);
-            dot_row!(acc3, 3, d3);
-            dot_row!(acc4, 4, d4);
-            dot_row!(acc5, 5, d5);
-            dot_row!(acc6, 6, d6);
-            dot_row!(acc7, 7, d7);
+/// Oito linhas em block_q8_0x8 (ver `repack_q8_0_8rows`) contra uma linha de ativações
+/// Q8_0: os quants de x são lidos uma vez por bloco e servem às oito linhas.
+fn dot_8linhas_repacked(grupo: &[u8], x_row: &[u8]) -> [f32; 8] {
+    let mut acc = [f32x8::ZERO; 8];
+    let blocos = grupo.as_chunks::<272>().0;
+    for (b, (p, bx)) in blocos.iter().zip(x_row.as_chunks::<34>().0).enumerate() {
+        // Prefetch do bloco b+2, como o kernel `std::arch` que isto substituiu.
+        #[cfg(target_feature = "sse")]
+        if let Some(prox) = blocos.get(b + 2) {
+            prox.as_chunks::<64>()
+                .0
+                .iter()
+                .for_each(safe_arch::prefetch_t0);
         }
-        [
-            hsum_f32_avx(acc0),
-            hsum_f32_avx(acc1),
-            hsum_f32_avx(acc2),
-            hsum_f32_avx(acc3),
-            hsum_f32_avx(acc4),
-            hsum_f32_avx(acc5),
-            hsum_f32_avx(acc6),
-            hsum_f32_avx(acc7),
-        ]
-    }
-}
-
-/// Fallback scalar para Q8_0 × Q8_0.
-#[inline]
-fn q8_0_q8_0_dot_scalar(w_row: &[u8], x_q8_row: &[u8], n_blocks: usize) -> f32 {
-    const Q: usize = 32;
-    const B: usize = 34;
-    let mut acc = 0.0f32;
-    for b in 0..n_blocks {
-        let bw = b * B;
-        let bx = b * B;
-        let dw = half::f16::from_bits(u16::from_le_bytes([w_row[bw], w_row[bw + 1]])).to_f32();
-        let dx =
-            half::f16::from_bits(u16::from_le_bytes([x_q8_row[bx], x_q8_row[bx + 1]])).to_f32();
-        let qsw = &w_row[bw + 2..bw + 2 + Q];
-        let qsx = &x_q8_row[bx + 2..bx + 2 + Q];
-        let mut dot = 0i32;
-        for i in 0..Q {
-            dot += i32::from(qsw[i].cast_signed()) * i32::from(qsx[i].cast_signed());
+        let (dx, qx) = bloco_q8_0(bx);
+        let (escalas, quants) = p.split_at(16);
+        let linhas = escalas
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(quants.as_chunks::<32>().0);
+        for (a, (d, qw)) in acc.iter_mut().zip(linhas) {
+            *a = dot_parcial(qw, qx).mul_add(f32x8::splat(escala(*d) * dx), *a);
         }
-        acc += dw * dx * (dot as f32);
     }
-    acc
+    acc.map(f32x8::reduce_add)
 }
 
 /// Otimização 2d — MUL_MAT Q8_0 com ativações também quantizadas (i8×i8 mais rápido que f32×i8).
 /// `x_q8`: saída de `quantize_q8_0_split(x, n_in, n_tok)`.
-/// Usa kernel de 4 linhas AVX2 para reduzir recargas de x — feature detectada uma vez por chamada.
 pub(crate) fn matmul_q8_0_actq(
     w: &[u8],
     x_q8: &[u8],
@@ -737,145 +346,16 @@ pub(crate) fn matmul_q8_0_actq(
     let n_blocks = n_in / Q;
     let row_bytes = n_blocks * B;
     let mut out = vec![0.0f32; n_tok * n_out];
-
-    #[cfg(target_arch = "x86_64")]
-    let use_avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
-    #[cfg(not(target_arch = "x86_64"))]
-    let use_avx2 = false;
-
-    #[cfg(target_arch = "x86_64")]
-    let use_f16c = use_avx2 && is_x86_feature_detected!("f16c");
-    #[cfg(not(target_arch = "x86_64"))]
-    let use_f16c = false;
-
-    // Static work division: one contiguous range per thread, like llamafile/tinyBLAS.
-    // ceil(n_out / n_threads) rounded up to nearest 8 for the 8-row inner kernel.
-    let n_threads = rayon::current_num_threads().max(1);
-    let chunk_size = {
-        let raw = n_out.div_ceil(n_threads);
-        raw.max(8).div_ceil(8) * 8
-    };
-
     for t in 0..n_tok {
         let x_row = &x_q8[t * row_bytes..(t + 1) * row_bytes];
         let o_row = &mut out[t * n_out..(t + 1) * n_out];
-
+        let linha = |(j, o): (usize, &mut f32)| {
+            *o = q8_0_q8_0_dot(&w[j * row_bytes..(j + 1) * row_bytes], x_row, n_blocks);
+        };
         if n_out >= PAR_MIN_N_OUT_Q8 {
-            if use_f16c {
-                // Kernel 8 linhas + F16C: metade dos recarregamentos de x, conversão f16 em 1 ciclo.
-                o_row
-                    .par_chunks_mut(chunk_size)
-                    .enumerate()
-                    .for_each(|(ci, chunk)| {
-                        let base_j = ci * chunk_size;
-                        let n_full8 = (chunk.len() / 8) * 8;
-                        let mut k = 0usize;
-                        while k < n_full8 {
-                            let j = base_j + k;
-                            // SAFETY: f16c+avx2 detectados; j+7 < n_out por construção.
-                            let [r0, r1, r2, r3, r4, r5, r6, r7] = unsafe {
-                                q8_0_q8_0_dot_8rows_avx2_f16c(
-                                    w.as_ptr().add(j * row_bytes),
-                                    row_bytes,
-                                    x_row.as_ptr(),
-                                    n_blocks,
-                                )
-                            };
-                            chunk[k] = r0;
-                            chunk[k + 1] = r1;
-                            chunk[k + 2] = r2;
-                            chunk[k + 3] = r3;
-                            chunk[k + 4] = r4;
-                            chunk[k + 5] = r5;
-                            chunk[k + 6] = r6;
-                            chunk[k + 7] = r7;
-                            k += 8;
-                        }
-                        // restante em grupos de 4
-                        let n_full4 = k + ((chunk.len() - k) / 4) * 4;
-                        while k < n_full4 {
-                            let j = base_j + k;
-                            let [r0, r1, r2, r3] = unsafe {
-                                q8_0_q8_0_dot_4rows_avx2(
-                                    w.as_ptr().add(j * row_bytes),
-                                    row_bytes,
-                                    x_row.as_ptr(),
-                                    n_blocks,
-                                )
-                            };
-                            chunk[k] = r0;
-                            chunk[k + 1] = r1;
-                            chunk[k + 2] = r2;
-                            chunk[k + 3] = r3;
-                            k += 4;
-                        }
-                        // split_at_mut, e não .skip(k): Skip<Enumerate<IterMut>> custou
-                        // ~4% de tok/s no decode — medido, ver docs/rust-memoria-e-desempenho.md.
-                        let (_, resto) = chunk.split_at_mut(k);
-                        for (rem, destino) in resto.iter_mut().enumerate() {
-                            let j = base_j + k + rem;
-                            *destino = q8_0_q8_0_dot_scalar(
-                                &w[j * row_bytes..(j + 1) * row_bytes],
-                                x_row,
-                                n_blocks,
-                            );
-                        }
-                    });
-            } else if use_avx2 {
-                o_row
-                    .par_chunks_mut(chunk_size)
-                    .enumerate()
-                    .for_each(|(ci, chunk)| {
-                        let base_j = ci * chunk_size;
-                        let n_full4 = (chunk.len() / 4) * 4;
-                        let mut k = 0usize;
-                        while k < n_full4 {
-                            let j = base_j + k;
-                            let [r0, r1, r2, r3] = unsafe {
-                                q8_0_q8_0_dot_4rows_avx2(
-                                    w.as_ptr().add(j * row_bytes),
-                                    row_bytes,
-                                    x_row.as_ptr(),
-                                    n_blocks,
-                                )
-                            };
-                            chunk[k] = r0;
-                            chunk[k + 1] = r1;
-                            chunk[k + 2] = r2;
-                            chunk[k + 3] = r3;
-                            k += 4;
-                        }
-                        // split_at_mut, e não .skip(k): Skip<Enumerate<IterMut>> custou
-                        // ~4% de tok/s no decode — medido, ver docs/rust-memoria-e-desempenho.md.
-                        let (_, resto) = chunk.split_at_mut(k);
-                        for (rem, destino) in resto.iter_mut().enumerate() {
-                            let j = base_j + k + rem;
-                            *destino = q8_0_q8_0_dot_scalar(
-                                &w[j * row_bytes..(j + 1) * row_bytes],
-                                x_row,
-                                n_blocks,
-                            );
-                        }
-                    });
-            } else {
-                o_row
-                    .par_chunks_mut(chunk_size)
-                    .enumerate()
-                    .for_each(|(ci, chunk)| {
-                        for (k, o) in chunk.iter_mut().enumerate() {
-                            let j = ci * chunk_size + k;
-                            *o = q8_0_q8_0_dot_scalar(
-                                &w[j * row_bytes..(j + 1) * row_bytes],
-                                x_row,
-                                n_blocks,
-                            );
-                        }
-                    });
-            }
+            o_row.par_iter_mut().enumerate().for_each(linha);
         } else {
-            for (j, o) in o_row.iter_mut().enumerate() {
-                *o = q8_0_q8_0_dot(&w[j * row_bytes..(j + 1) * row_bytes], x_row, n_blocks);
-            }
+            o_row.iter_mut().enumerate().for_each(linha);
         }
     }
     out
@@ -895,16 +375,11 @@ pub(crate) fn matmul_q8_0_actq_packed(
 ) -> Vec<f32> {
     const Q: usize = 32;
     const B: usize = 34;
+    const PB: usize = 272;
     let n_blocks = n_in / Q;
     let row_bytes = n_blocks * B;
+    let group_bytes = n_blocks * PB;
     let mut out = vec![0.0f32; n_tok * n_out];
-
-    #[cfg(target_arch = "x86_64")]
-    let use_f16c = is_x86_feature_detected!("avx2")
-        && is_x86_feature_detected!("fma")
-        && is_x86_feature_detected!("f16c");
-    #[cfg(not(target_arch = "x86_64"))]
-    let use_f16c = false;
 
     // Static work division: one contiguous range per thread (same as llamafile).
     let n_threads = rayon::current_num_threads().max(1);
@@ -912,35 +387,29 @@ pub(crate) fn matmul_q8_0_actq_packed(
         let raw = n_out_packed.max(1).div_ceil(n_threads);
         raw.max(8).div_ceil(8) * 8
     };
-    let n_groups = n_out_packed / 8;
 
     for t in 0..n_tok {
         let x_row = &x_q8[t * row_bytes..(t + 1) * row_bytes];
         let o_row = &mut out[t * n_out..(t + 1) * n_out];
         let (o_packed, o_tail) = o_row.split_at_mut(n_out_packed);
 
-        // Repacked groups of 8 rows — spin pool (overhead ~1-3 µs vs ~26 µs rayon)
-        if use_f16c && n_groups > 0 {
-            let n_chunks = n_out_packed.div_ceil(chunk_size);
-            let batch = crate::spin_pool::MatmulBatch {
-                packed_w: packed_w.as_ptr(),
-                x_row: x_row.as_ptr(),
-                w_tail: w_tail.as_ptr(),
-                out: o_packed.as_mut_ptr(),
-                n_blocks,
-                chunk_size,
-                n_out_packed,
-                row_bytes,
-            };
-            // SAFETY: batch vive até dispatch retornar; ponteiros dentro de packed_w/x_row válidos.
-            unsafe {
-                crate::spin_pool::dispatch(&batch, n_chunks);
-            }
-        }
+        o_packed
+            .par_chunks_mut(chunk_size)
+            .zip(packed_w.par_chunks(chunk_size / 8 * group_bytes))
+            .for_each(|(saida, grupos)| {
+                for (s, g) in saida
+                    .as_chunks_mut::<8>()
+                    .0
+                    .iter_mut()
+                    .zip(grupos.chunks_exact(group_bytes))
+                {
+                    *s = dot_8linhas_repacked(g, x_row);
+                }
+            });
 
         // Tail rows (not multiple of 8)
         for (j, o) in o_tail.iter_mut().enumerate() {
-            *o = q8_0_q8_0_dot_scalar(&w_tail[j * row_bytes..(j + 1) * row_bytes], x_row, n_blocks);
+            *o = q8_0_q8_0_dot(&w_tail[j * row_bytes..(j + 1) * row_bytes], x_row, n_blocks);
         }
     }
     out
@@ -999,35 +468,6 @@ pub(crate) fn softmax(z: &mut [f32]) {
         for v in z.iter_mut() {
             *v /= sum;
         }
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Wrappers pub(crate) para uso em spin_pool
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// SAFETY: AVX2+FMA+F16C devem estar disponíveis; ponteiros válidos por n_blocks blocos.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma,f16c")]
-pub(crate) unsafe fn q8_0_q8_0_dot_8rows_repacked_f16c_pub(
-    packed_ptr: *const u8,
-    x_ptr: *const u8,
-    n_blocks: usize,
-) -> [f32; 8] {
-    unsafe { q8_0_q8_0_dot_8rows_repacked_f16c(packed_ptr, x_ptr, n_blocks) }
-}
-
-/// SAFETY: w_ptr e x_ptr devem apontar para pelo menos `row_bytes` bytes válidos.
-pub(crate) unsafe fn q8_0_q8_0_dot_scalar_pub(
-    w_ptr: *const u8,
-    x_ptr: *const u8,
-    n_blocks: usize,
-    row_bytes: usize,
-) -> f32 {
-    unsafe {
-        let w_row = std::slice::from_raw_parts(w_ptr, row_bytes);
-        let x_row = std::slice::from_raw_parts(x_ptr, row_bytes);
-        q8_0_q8_0_dot_scalar(w_row, x_row, n_blocks)
     }
 }
 
@@ -1242,5 +682,82 @@ mod tests {
             got[1],
             expected[1]
         );
+    }
+}
+
+/// Bancada dos kernels Q8_0 de CPU (mediana de 50 execuções, em µs).
+/// `numactl --cpunodebind=0 --membind=0 cargo test --release -p llama-model bancada_cpu -- --ignored --nocapture`
+#[cfg(test)]
+mod bancada {
+    use super::*;
+    use std::time::Instant;
+
+    /// Linhas Q8_0 válidas (escala f16 pequena + quants pseudoaleatórios).
+    fn pesos_q8_0(n_linhas: usize, n_in: usize, semente: u64) -> Vec<u8> {
+        let mut s = semente;
+        let mut out = Vec::with_capacity(n_linhas * n_in / 32 * 34);
+        for _ in 0..n_linhas * n_in / 32 {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            out.extend_from_slice(
+                &half::f16::from_f32(0.001 + (s >> 40) as f32 * 1e-9)
+                    .to_bits()
+                    .to_le_bytes(),
+            );
+            for _ in 0..32 {
+                s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                out.push((s >> 56) as u8);
+            }
+        }
+        out
+    }
+
+    fn mediana_us(mut f: impl FnMut() -> f32) -> (f64, f32) {
+        let mut chk = 0.0;
+        for _ in 0..5 {
+            chk = f();
+        }
+        let mut t: Vec<f64> = (0..50)
+            .map(|_| {
+                let i = Instant::now();
+                chk = std::hint::black_box(f());
+                i.elapsed().as_secs_f64() * 1e6
+            })
+            .collect();
+        t.sort_by(f64::total_cmp);
+        (t[25], chk)
+    }
+
+    #[test]
+    #[ignore = "bancada: rodar em --release"]
+    fn bancada_cpu() {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(7)
+            .build_global();
+        for &(n_in, n_out, n_tok) in &[(4096, 4096, 1), (4096, 14336, 1), (4096, 4096, 32)] {
+            let w = pesos_q8_0(n_out, n_in, 7);
+            let x: Vec<f32> = (0..n_in * n_tok)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.01)
+                .collect();
+            let xq = quantize_q8_0_split(&x, n_in, n_tok);
+            let packed = repack_q8_0_8rows(&w, n_in, n_out);
+            let soma = |v: Vec<f32>| v.iter().sum::<f32>();
+            let (q, _) = mediana_us(|| quantize_q8_0_split(&x, n_in, n_tok).len() as f32);
+            let (a, ca) = mediana_us(|| soma(matmul_q8_0(&w, &x, n_in, n_out, n_tok)));
+            let (b, cb) = mediana_us(|| soma(matmul_q8_0_actq(&w, &xq, n_in, n_out, n_tok)));
+            let (c, cc) = mediana_us(|| {
+                soma(matmul_q8_0_actq_packed(
+                    &packed,
+                    &[],
+                    &xq,
+                    n_in,
+                    n_out,
+                    n_out,
+                    n_tok,
+                ))
+            });
+            println!(
+                "{n_in}x{n_out} tok={n_tok}: quantize {q:.1} | q8_0×f32 {a:.1} ({ca:.4}) | actq {b:.1} ({cb:.4}) | packed {c:.1} ({cc:.4})"
+            );
+        }
     }
 }

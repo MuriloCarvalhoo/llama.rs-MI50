@@ -18,7 +18,7 @@ llama-chat.workspace = true
 llama-model = { path = "../llama-model", features = ["gpu"] }
 llama-sampling.workspace = true
 rand.workspace = true
-memmap2 = "0.9"
+llama-sys.workspace = true
 llama-vulkan = { path = "../llama-vulkan", optional = true }
 
 [features]

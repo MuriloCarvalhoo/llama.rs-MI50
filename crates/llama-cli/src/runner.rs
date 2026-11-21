@@ -11,25 +11,6 @@ use rand::rngs::SmallRng;
 
 use crate::args::Args;
 
-/// Mapeia o `.gguf` em memória em vez de copiá-lo para a RAM. Um `fs::read` do
-/// 14B Q8_0 aloca 15 GB de RAM anônima antes mesmo dos pesos serem extraídos;
-/// com mmap as páginas ficam no page cache e são recuperáveis sob pressão.
-///
-/// `populate` (`MAP_POPULATE`) faz o prefault das page tables na hora do mapa, e
-/// `Advice::Sequential` dá ao kernel a janela de readahead do padrão desta carga: ler
-/// tudo uma vez, em ordem, para subir à VRAM. Sem os dois, o page-in acontece como
-/// tempestade de page fault **no meio** do memcpy para o staging, serializado com ele.
-fn map_model(path: &std::path::Path) -> Result<memmap2::Mmap, std::io::Error> {
-    let file = std::fs::File::open(path)?;
-    // SAFETY: mapeamento read-only de um arquivo tratado como imutável durante a
-    // execução. Modificação externa do .gguf enquanto mapeado seria UB — mesma
-    // premissa que o llama.cpp adota para o seu mmap de modelo.
-    let mm = unsafe { memmap2::MmapOptions::new().populate().map(&file) }?;
-    // Conselho ao kernel, não contrato: se o SO recusar, a carga só fica mais lenta.
-    let _ = mm.advise(memmap2::Advice::Sequential);
-    Ok(mm)
-}
-
 /// Config do modelo com o contexto limitado por `--ctx` (nunca acima do que o GGUF declara).
 fn model_config(f: &GgufFile, args: &Args) -> Result<llama_model::LlamaConfig, ModelError> {
     let mut config = llama_model::LlamaConfig::from_gguf(f)?;
@@ -55,52 +36,6 @@ fn read_numa_node_cpus(node: usize) -> Vec<usize> {
     cpus
 }
 
-/// Pina a thread atual ao conjunto de CPUs fornecido via sched_setaffinity.
-/// cpu_set_t = 128 bytes (1024 bits) em Linux x86_64.
-/// SAFETY: mask é array local de 128 bytes válido; pid=0 = thread atual.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn pin_thread_to_cpus(cpus: &[usize]) {
-    let mut mask = [0u64; 16];
-    for &cpu in cpus {
-        // get_mut carrega a mesma garantia que o `cpu < 1024` fazia: 16 palavras de 64 bits.
-        if let Some(palavra) = mask.get_mut(cpu / 64) {
-            *palavra |= 1u64 << (cpu % 64);
-        }
-    }
-    unsafe {
-        std::arch::asm!(
-            "syscall",
-            inlateout("rax") 203u64 => _,
-            in("rdi") 0u64,
-            in("rsi") 128u64,
-            in("rdx") mask.as_ptr(),
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-}
-
-/// Define política MPOL_BIND para NUMA node 0 via set_mempolicy.
-/// Pesos carregados vão para a RAM local do socket 0 (acesso ~10 ns).
-/// SAFETY: nodemask é u64 local válido; syscall 238 é set_mempolicy no x86_64.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn bind_memory_to_node0() {
-    let nodemask: u64 = 1u64; // bit 0 = NUMA node 0
-    unsafe {
-        std::arch::asm!(
-            "syscall",
-            inlateout("rax") 238u64 => _,  // set_mempolicy
-            in("rdi") 2u64,                  // MPOL_BIND
-            in("rsi") &nodemask as *const u64,
-            in("rdx") 64u64,                 // maxnode
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-}
-
 /// Chamado ANTES de carregar o modelo: pina CPU ao node 0 e define MPOL_BIND
 /// para que os ~500 MB de pesos fiquem na RAM local do socket 0.
 fn init_numa_before_load() {
@@ -112,8 +47,8 @@ fn init_numa_before_load() {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         if !numa0_cpus.is_empty() {
-            pin_thread_to_cpus(&numa0_cpus);
-            bind_memory_to_node0();
+            llama_sys::pinar_thread(&numa0_cpus);
+            llama_sys::ligar_memoria_ao_no0();
         }
     }
 
@@ -147,7 +82,7 @@ fn init_rayon_after_model_load() {
                 let _ = rayon::ThreadPoolBuilder::new()
                     .num_threads(n)
                     .start_handler(move |_tid| {
-                        pin_thread_to_cpus(&numa0_cpus);
+                        llama_sys::pinar_thread(&numa0_cpus);
                     })
                     .build_global();
                 return;
@@ -278,7 +213,7 @@ pub fn run_generate(
     let trace_guard = args.trace.clone().map(crate::trace::init);
 
     let fase_mmap = llama_model::perfil_carga::Fase::nova("mmap+parse");
-    let bytes = map_model(&args.model)?;
+    let bytes = llama_sys::mapear_para_carga(&args.model)?;
     let f = GgufFile::parse(&bytes)?;
     let cfg = model_config(&f, args)?;
     drop(fase_mmap);
@@ -298,24 +233,10 @@ pub fn run_generate(
     };
     // Criar pool rayon DEPOIS do load: workers herdam afinidade e política de memória.
     init_rayon_after_model_load();
-    // O spin pool serve só ao matmul Q8_0 de CPU. Nos backends GPU ele nunca é
-    // despachado, mas os N-1 workers ficam em busy-wait permanente queimando todos os
-    // núcleos: o `perf` de um decode do 32B em layer-split mostrou 97.6% dos ciclos em
-    // `llama-spin`. A thread que grava o command buffer, copia os logits e faz o argmax
-    // disputa CPU com eles, e o tempo por token oscilava 13.4–15.1 tok/s sem que o
-    // tempo de GPU mudasse.
     if !usa_gpu {
         // Acordar todos os workers rayon com um broadcast noop — evita latência de
         // wakeup no primeiro matmul paralelo (workers ficam em spin-wait ~1ms após wakeup).
         rayon::broadcast(|_| {});
-        // Inicializar spin pool com N-1 workers (N = rayon thread count).
-        // Pinar workers ao node 0 (mesma afinidade dos rayon workers) para acesso local à RAM.
-        #[cfg(target_os = "linux")]
-        let numa0_cpus = read_numa_node_cpus(0);
-        #[cfg(not(target_os = "linux"))]
-        let numa0_cpus: Vec<usize> = Vec::new();
-        let n_workers = rayon::current_num_threads().saturating_sub(1);
-        llama_model::init_spin_pool(n_workers, numa0_cpus);
     }
     let tokenizer = Tokenizer::from_gguf(&f)?;
     let sampler = choose_sampler(args);
@@ -540,7 +461,7 @@ pub fn run_generate(
 /// Carrega o modelo e retorna o texto completo como String (sem streaming).
 /// Mantém compatibilidade com `greedy_gate.rs` e outros testes de integracao.
 pub fn generate_text(args: &Args) -> Result<String, Box<dyn std::error::Error>> {
-    let bytes = map_model(&args.model)?;
+    let bytes = llama_sys::mapear_para_carga(&args.model)?;
     let f = GgufFile::parse(&bytes)?;
     let model = Model::load(&f, &bytes)?;
     let tokenizer = Tokenizer::from_gguf(&f)?;

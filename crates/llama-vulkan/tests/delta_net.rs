@@ -18,10 +18,8 @@ fn ctx_fwd() -> Option<(VulkanContext, ())> {
 }
 
 /// Bytes de um push constant qualquer.
-fn push_bytes<T: Copy>(p: &T) -> Vec<u8> {
-    let n = std::mem::size_of::<T>();
-    // SAFETY: T é POD (struct de u32/f32 repr(C)); lemos exatamente o seu tamanho.
-    unsafe { std::slice::from_raw_parts(std::ptr::from_ref(p).cast::<u8>(), n) }.to_vec()
+fn push_bytes<T: bytemuck::Pod>(p: &T) -> Vec<u8> {
+    bytemuck::bytes_of(p).to_vec()
 }
 
 fn pseudo(n: usize, semente: usize) -> Vec<f32> {
@@ -40,8 +38,8 @@ fn max_dif(a: &[f32], b: &[f32]) -> f32 {
 /// Push constant do `delta_net.comp`. `n_tok` é o bloco processado dentro do kernel e
 /// `v_stride` o passo entre tokens em `v` — que no plano é `conv_dim`, não `n_heads * d`,
 /// porque `v` é a última fatia do buffer da convolução.
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
-#[derive(Clone, Copy)]
 struct PDelta {
     d: u32,
     n_heads: u32,
@@ -51,8 +49,8 @@ struct PDelta {
 }
 
 /// Push constant do `dn_conv.comp`.
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
-#[derive(Clone, Copy)]
 struct PConv {
     canais: u32,
     d_conv: u32,
@@ -60,8 +58,8 @@ struct PConv {
 }
 
 /// Push constant do `dn_l2_qk.comp`. `stride` é o passo entre tokens na entrada.
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
-#[derive(Clone, Copy)]
 struct PL2Qk {
     dim: u32,
     n_heads: u32,
@@ -457,8 +455,8 @@ fn gates_batem_com_a_referencia_de_cpu() {
         .flat_map(|h| [-(0.5 + 0.1 * h as f32), 0.2 * h as f32 - 0.5])
         .collect();
 
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
     #[repr(C)]
-    #[derive(Clone, Copy)]
     struct P {
         n_embd: u32,
         n_heads: u32,
@@ -521,8 +519,8 @@ fn norm_l2_e_norm_gated_batem_com_a_referencia() {
     let w = pseudo(dim, 32);
     let z = pseudo(n_heads * dim, 33);
 
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
     #[repr(C)]
-    #[derive(Clone, Copy)]
     struct P {
         dim: u32,
         n_heads: u32,
@@ -670,8 +668,8 @@ fn gate_quant_bate_com_o_portao_da_cpu_e_com_o_quantize_x() {
     // `b_q`: por cabeça, query na primeira metade e portão na segunda.
     let q = pseudo(n_head * 2 * head_dim, 62);
 
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
     #[repr(C)]
-    #[derive(Clone, Copy)]
     struct P {
         n: u32,
         head_dim: u32,
@@ -826,8 +824,8 @@ fn kv_pack_escreve_o_bloco_convertido_no_slot() {
         // helper são f32; o shader os escreve como u32 — mesmo tamanho, reinterpretado.
         let cache = vec![0f32; slot_off_par + n_pares + kv_dim];
 
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
         #[repr(C)]
-        #[derive(Clone, Copy)]
         struct P {
             n_pares: u32,
             dst_par: u32,

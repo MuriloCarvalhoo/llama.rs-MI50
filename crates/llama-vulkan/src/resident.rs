@@ -61,21 +61,19 @@ impl Buffers {
         &mut self,
         ctx: &VulkanContext,
         phys: &VulkanPhysicalDevice,
-        d: &ash::Device,
+        d: &crate::ffi::Device,
         x_size: vk::DeviceSize,
         y_size: vk::DeviceSize,
     ) -> Result<(), MatmulError> {
         use crate::tensor::{alloc_and_bind, create_buf};
 
         if x_size > self.x_cap {
-            // SAFETY: handles ou são nulos (no-op) ou foram criados por nós e não
+            // handles ou são nulos (no-op) ou foram criados por nós e não
             // estão em uso (wait_idle precedeu esta chamada).
-            unsafe {
-                d.destroy_buffer(self.x_staging, None);
-                d.free_memory(self.x_staging_mem, None);
-                d.destroy_buffer(self.x_dev, None);
-                d.free_memory(self.x_dev_mem, None);
-            }
+            d.destroy_buffer(self.x_staging, None);
+            d.free_memory(self.x_staging_mem, None);
+            d.destroy_buffer(self.x_dev, None);
+            d.free_memory(self.x_dev_mem, None);
             // Zera os handles antes de qualquer alocação falível: se um `?` abaixo
             // disparar, um `ensure`/`destroy` posterior vê nulos (no-op), não double-free.
             self.x_staging = vk::Buffer::null();
@@ -95,13 +93,11 @@ impl Buffers {
         }
 
         if y_size > self.y_cap {
-            // SAFETY: idem lado X.
-            unsafe {
-                d.destroy_buffer(self.y_dev, None);
-                d.free_memory(self.y_dev_mem, None);
-                d.destroy_buffer(self.y_read, None);
-                d.free_memory(self.y_read_mem, None);
-            }
+            // idem lado X.
+            d.destroy_buffer(self.y_dev, None);
+            d.free_memory(self.y_dev_mem, None);
+            d.destroy_buffer(self.y_read, None);
+            d.free_memory(self.y_read_mem, None);
             // Zera os handles antes da alocação falível (ver lado X).
             self.y_dev = vk::Buffer::null();
             self.y_dev_mem = vk::DeviceMemory::null();
@@ -122,18 +118,16 @@ impl Buffers {
     }
 
     /// Libera todos os handles. Chamar uma vez no Drop do `ResidentGpu`.
-    fn destroy(&mut self, d: &ash::Device) {
-        // SAFETY: handles criados por nós; chamado no Drop, sem uso concorrente.
-        unsafe {
-            d.destroy_buffer(self.x_staging, None);
-            d.free_memory(self.x_staging_mem, None);
-            d.destroy_buffer(self.x_dev, None);
-            d.free_memory(self.x_dev_mem, None);
-            d.destroy_buffer(self.y_dev, None);
-            d.free_memory(self.y_dev_mem, None);
-            d.destroy_buffer(self.y_read, None);
-            d.free_memory(self.y_read_mem, None);
-        }
+    fn destroy(&mut self, d: &crate::ffi::Device) {
+        // handles criados por nós; chamado no Drop, sem uso concorrente.
+        d.destroy_buffer(self.x_staging, None);
+        d.free_memory(self.x_staging_mem, None);
+        d.destroy_buffer(self.x_dev, None);
+        d.free_memory(self.x_dev_mem, None);
+        d.destroy_buffer(self.y_dev, None);
+        d.free_memory(self.y_dev_mem, None);
+        d.destroy_buffer(self.y_read, None);
+        d.free_memory(self.y_read_mem, None);
     }
 }
 
@@ -177,22 +171,20 @@ impl<'ctx> ResidentGpu<'ctx> {
             p_pool_sizes: pool_sizes.as_ptr(),
             ..Default::default()
         };
-        // SAFETY: d válido; pool_info aponta para dados válidos na stack.
-        let desc_pool = unsafe {
-            d.create_descriptor_pool(&pool_info, None)
-                .map_err(|e| ModelError::Gpu(format!("desc pool: {e}")))?
-        };
+        // d válido; pool_info aponta para dados válidos na stack.
+        let desc_pool = d
+            .create_descriptor_pool(&pool_info, None)
+            .map_err(|e| ModelError::Gpu(format!("desc pool: {e}")))?;
         let alloc_info = vk::DescriptorSetAllocateInfo {
             descriptor_pool: desc_pool,
             descriptor_set_count: 1,
             p_set_layouts: &pipeline.desc_set_layout,
             ..Default::default()
         };
-        // SAFETY: d e desc_pool válidos; layout vem da pipeline recém-criada.
-        let desc_set = unsafe {
-            d.allocate_descriptor_sets(&alloc_info)
-                .map_err(|e| ModelError::Gpu(format!("desc set: {e}")))?[0]
-        };
+        // d e desc_pool válidos; layout vem da pipeline recém-criada.
+        let desc_set = d
+            .allocate_descriptor_sets(&alloc_info)
+            .map_err(|e| ModelError::Gpu(format!("desc set: {e}")))?[0];
 
         Ok(Self {
             ctx,
@@ -259,22 +251,17 @@ impl<'ctx> ResidentGpu<'ctx> {
         let (xq, xd) = crate::tensor::quantize_x_host(x_f32);
         let xq_size = std::mem::size_of_val(&xq[..]) as vk::DeviceSize;
         let xd_size = std::mem::size_of_val(&xd[..]) as vk::DeviceSize;
-        unsafe {
-            // SAFETY: x_staging_mem host-visible com x_cap >= x_size >= xq_size+xd_size;
-            // ptr válido até unmap; as duas escritas nao se sobrepoem.
-            let ptr = d.map_memory(
+        {
+            // x_staging_mem host-visible com x_cap >= x_size >= xq_size+xd_size.
+            let mut mapa = d.map_memory(
                 buffers.x_staging_mem,
                 0,
                 x_size,
                 vk::MemoryMapFlags::empty(),
             )?;
-            let base = ptr.cast::<u8>();
-            std::ptr::copy_nonoverlapping(xq.as_ptr().cast::<u8>(), base, xq_size as usize);
-            std::ptr::copy_nonoverlapping(
-                xd.as_ptr().cast::<u8>(),
-                base.add(xq_size as usize),
-                xd_size as usize,
-            );
+            let (q, resto) = mapa.bytes_mut().split_at_mut(xq_size as usize);
+            q.copy_from_slice(bytemuck::cast_slice(&xq));
+            resto[..xd_size as usize].copy_from_slice(bytemuck::cast_slice(&xd));
             d.unmap_memory(buffers.x_staging_mem);
         }
         one_shot_copy(
@@ -332,10 +319,10 @@ impl<'ctx> ResidentGpu<'ctx> {
                 ..Default::default()
             })
             .collect();
-        // SAFETY: d válido; writes apontam para buf_infos vivos na stack. O desc_set não
+        // d válido; writes apontam para buf_infos vivos na stack. O desc_set não
         // está em uso: na 1ª chamada nenhum cmd o referenciou; nas demais o queue_wait_idle
         // do dispatch anterior garantiu GPU ociosa.
-        unsafe { d.update_descriptor_sets(&writes, &[]) };
+        d.update_descriptor_sets(&writes, &[]);
 
         // 4. Command buffer (ainda por-chamada nesta fatia; fusão vira 1 cmd/token na Fase 1D).
         let cb_info = vk::CommandBufferAllocateInfo {
@@ -344,8 +331,8 @@ impl<'ctx> ResidentGpu<'ctx> {
             command_buffer_count: 1,
             ..Default::default()
         };
-        // SAFETY: d e cmd_pool válidos.
-        let cmd = unsafe { d.allocate_command_buffers(&cb_info)? }[0];
+        // d e cmd_pool válidos.
+        let cmd = d.allocate_command_buffers(&cb_info)?[0];
         let begin = vk::CommandBufferBeginInfo {
             flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
             ..Default::default()
@@ -356,44 +343,35 @@ impl<'ctx> ResidentGpu<'ctx> {
             row_offset: 0,
             tem_bias: 0,
         };
-        unsafe {
-            // SAFETY: cmd recém-alocado; desc_set/pipeline válidos.
-            d.begin_command_buffer(cmd, &begin)?;
-            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline.pipeline);
-            d.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                self.pipeline.layout,
-                0,
-                &[self.desc_set],
-                &[],
-            );
-            d.cmd_push_constants(
-                cmd,
-                self.pipeline.layout,
-                vk::ShaderStageFlags::COMPUTE,
-                0,
-                // SAFETY: PushConstants é #[repr(C)] 3×u32; slice de bytes válido.
-                std::slice::from_raw_parts(
-                    &push as *const PushConstants as *const u8,
-                    std::mem::size_of::<PushConstants>(),
-                ),
-            );
-            d.cmd_dispatch(cmd, n_out as u32, 1, 1);
-            d.end_command_buffer(cmd)?;
-        }
+        // cmd recém-alocado; desc_set/pipeline válidos.
+        d.begin_command_buffer(cmd, &begin)?;
+        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline.pipeline);
+        d.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.pipeline.layout,
+            0,
+            &[self.desc_set],
+            &[],
+        );
+        d.cmd_push_constants(
+            cmd,
+            self.pipeline.layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            bytemuck::bytes_of(&push),
+        );
+        d.cmd_dispatch(cmd, n_out as u32, 1, 1);
+        d.end_command_buffer(cmd)?;
         let submit = vk::SubmitInfo {
             command_buffer_count: 1,
             p_command_buffers: &cmd,
             ..Default::default()
         };
-        unsafe {
-            // SAFETY: queue, submit e cmd válidos.
-            d.queue_submit(dev.queue, &[submit], vk::Fence::null())?;
-            d.queue_wait_idle(dev.queue)?;
-            d.free_command_buffers(dev.cmd_pool, &[cmd]);
-        }
-
+        // queue, submit e cmd válidos.
+        d.queue_submit(dev.queue, &[submit], vk::Fence::null())?;
+        d.queue_wait_idle(dev.queue)?;
+        d.free_command_buffers(dev.cmd_pool, &[cmd]);
         // 5. Readback de Y do device-local residente para o host-visible residente.
         one_shot_copy(
             d,
@@ -403,14 +381,11 @@ impl<'ctx> ResidentGpu<'ctx> {
             buffers.y_read,
             y_size,
         )?;
-        let out = unsafe {
-            // SAFETY: y_read_mem host-visible com y_cap >= y_size; ptr válido até unmap.
-            let ptr = d.map_memory(buffers.y_read_mem, 0, y_size, vk::MemoryMapFlags::empty())?;
-            let mut v = vec![0f32; n_out];
-            std::ptr::copy_nonoverlapping(ptr as *const f32, v.as_mut_ptr(), n_out);
-            d.unmap_memory(buffers.y_read_mem);
-            v
-        };
+        // y_read_mem host-visible com y_cap >= y_size.
+        let out = d
+            .map_memory(buffers.y_read_mem, 0, y_size, vk::MemoryMapFlags::empty())?
+            .ler::<f32>(n_out);
+        d.unmap_memory(buffers.y_read_mem);
         Ok(out)
     }
 }
@@ -418,21 +393,17 @@ impl<'ctx> ResidentGpu<'ctx> {
 impl Drop for ResidentGpu<'_> {
     fn drop(&mut self) {
         let d = &self.dev.device;
-        // SAFETY: wait_idle garante que nenhum recurso está em uso pela GPU.
-        unsafe {
-            let _ = d.device_wait_idle();
-        }
+        // wait_idle garante que nenhum recurso está em uso pela GPU.
+        let _ = d.device_wait_idle();
         self.buffers.borrow_mut().destroy(d);
         for (_, t) in self.weights.borrow_mut().drain() {
             t.destroy(d);
         }
-        // SAFETY: desc_pool/pipeline criados por nós; ordem inversa de criação.
-        unsafe {
-            d.destroy_descriptor_pool(self.desc_pool, None);
-            d.destroy_pipeline(self.pipeline.pipeline, None);
-            d.destroy_pipeline_layout(self.pipeline.layout, None);
-            d.destroy_descriptor_set_layout(self.pipeline.desc_set_layout, None);
-        }
+        // desc_pool/pipeline criados por nós; ordem inversa de criação.
+        d.destroy_descriptor_pool(self.desc_pool, None);
+        d.destroy_pipeline(self.pipeline.pipeline, None);
+        d.destroy_pipeline_layout(self.pipeline.layout, None);
+        d.destroy_descriptor_set_layout(self.pipeline.desc_set_layout, None);
     }
 }
 

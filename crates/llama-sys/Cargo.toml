@@ -1,0 +1,18 @@
+[package]
+name = "llama-sys"
+version = "0.1.0"
+edition.workspace = true
+
+# Único crate (além do `ffi` do llama-vulkan) com `unsafe`: as chamadas ao SO que não têm
+# API segura — mmap do modelo, afinidade de CPU e política NUMA.
+[dependencies]
+memmap2 = "0.9"
+libc = "0.2"
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

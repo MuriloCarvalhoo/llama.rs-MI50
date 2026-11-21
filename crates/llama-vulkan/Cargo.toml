@@ -12,9 +12,10 @@ llama-model = { workspace = true, features = ["gpu"] }
 tracing = { version = "0.1.44", optional = true }
 gguf = { version = "0.1.0", path = "../gguf" }
 libc = "0.2"
+bytemuck = { version = "1.25.2", features = ["derive"] }
 
 [dev-dependencies]
-memmap2 = "0.9"
+llama-sys.workspace = true
 gguf = { workspace = true }
 llama-tokenizer = { workspace = true }
 llama-sampling = { workspace = true }
@@ -26,7 +27,7 @@ half.workspace = true
 shaderc = "0.10"
 
 [lints.rust]
-unsafe_code = "allow"
+unsafe_code = "deny"
 
 [features]
 # Instrumentacao da timeline (ver llama-cli --trace).

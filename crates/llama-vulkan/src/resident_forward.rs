@@ -380,7 +380,7 @@ impl Buf {
     fn device(
         ctx: &VulkanContext,
         phys: &VulkanPhysicalDevice,
-        d: &ash::Device,
+        d: &crate::ffi::Device,
         bytes: vk::DeviceSize,
     ) -> Result<Self, MatmulError> {
         use crate::tensor::{alloc_and_bind, create_buf};
@@ -400,7 +400,7 @@ impl Buf {
     fn host(
         ctx: &VulkanContext,
         phys: &VulkanPhysicalDevice,
-        d: &ash::Device,
+        d: &crate::ffi::Device,
         bytes: vk::DeviceSize,
     ) -> Result<Self, MatmulError> {
         use crate::tensor::{alloc_and_bind, create_buf};
@@ -414,7 +414,7 @@ impl Buf {
     fn host_read(
         ctx: &VulkanContext,
         phys: &VulkanPhysicalDevice,
-        d: &ash::Device,
+        d: &crate::ffi::Device,
         bytes: vk::DeviceSize,
     ) -> Result<Self, MatmulError> {
         use crate::tensor::{alloc_and_bind_cached, create_buf};
@@ -432,7 +432,7 @@ impl Buf {
     /// destruído aqui: ainda não existe o `Buf` cujo `destroy` o levaria, e numa carga que
     /// esbarra na VRAM ele sobrava até o fim do processo.
     fn montar(
-        d: &ash::Device,
+        d: &crate::ffi::Device,
         buffer: vk::Buffer,
         mem: Result<vk::DeviceMemory, vk::Result>,
         size: vk::DeviceSize,
@@ -440,19 +440,17 @@ impl Buf {
         match mem {
             Ok(mem) => Ok(Self { buffer, mem, size }),
             Err(e) => {
-                // SAFETY: buffer criado pelo chamador neste device, sem memória nem uso.
-                unsafe { d.destroy_buffer(buffer, None) };
+                // buffer criado pelo chamador neste device, sem memória nem uso.
+                d.destroy_buffer(buffer, None);
                 Err(e.into())
             }
         }
     }
 
-    fn destroy(&self, d: &ash::Device) {
-        // SAFETY: handles criados por nós; chamado no Drop, sem uso concorrente.
-        unsafe {
-            d.destroy_buffer(self.buffer, None);
-            d.free_memory(self.mem, None);
-        }
+    fn destroy(&self, d: &crate::ffi::Device) {
+        // handles criados por nós; chamado no Drop, sem uso concorrente.
+        d.destroy_buffer(self.buffer, None);
+        d.free_memory(self.mem, None);
     }
 }
 
@@ -1100,7 +1098,7 @@ pub(crate) struct ResidentState<'w> {
     pub logits_host: Buf,
     /// Mapa persistente de `logits_host`. Mapear/desmapear por token custa dois ioctls no
     /// caminho crítico. Válido enquanto o `State` viver (unmap no Drop).
-    pub logits_ptr: *mut std::ffi::c_void,
+    pub logits_mapa: crate::ffi::Mapa,
     pub len: RefCell<usize>,
     /// Cópia do `estado` e da `janela` de cada camada linear numa fronteira de turno, para
     /// que uma divergência depois dela não custe reprocessar o prompt inteiro — ver
@@ -1287,8 +1285,8 @@ impl<'ctx> ResidentForward<'ctx> {
             p_set_layouts: &pipe.desc_set_layout,
             ..Default::default()
         };
-        // SAFETY: d e pool válidos; layout vem da pipeline.
-        Ok(unsafe { d.allocate_descriptor_sets(&info)? }[0])
+        // d e pool válidos; layout vem da pipeline.
+        Ok(d.allocate_descriptor_sets(&info)?[0])
     }
 
     /// Escreve `bindings` no `set` (na ordem 0..n) e despacha `pipe` com `push` bytes e
@@ -1353,8 +1351,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 ..Default::default()
             })
             .collect();
-        // SAFETY: d válido; writes apontam para buf_infos vivos; GPU ociosa (wait por op).
-        unsafe { d.update_descriptor_sets(&writes, &[]) };
+        // d válido; writes apontam para buf_infos vivos; GPU ociosa (wait por op).
+        d.update_descriptor_sets(&writes, &[]);
 
         let cb_info = vk::CommandBufferAllocateInfo {
             command_pool: dev.cmd_pool,
@@ -1362,41 +1360,37 @@ impl<'ctx> ResidentForward<'ctx> {
             command_buffer_count: 1,
             ..Default::default()
         };
-        // SAFETY: d e cmd_pool válidos.
-        let cmd = unsafe { d.allocate_command_buffers(&cb_info)? }[0];
+        // d e cmd_pool válidos.
+        let cmd = d.allocate_command_buffers(&cb_info)?[0];
         let begin = vk::CommandBufferBeginInfo {
             flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
             ..Default::default()
         };
-        unsafe {
-            // SAFETY: cmd recém-alocado; pipe/set válidos; push tem o tamanho do range do layout.
-            d.begin_command_buffer(cmd, &begin)?;
-            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe.pipeline);
-            d.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                pipe.layout,
-                0,
-                &[set],
-                &[],
-            );
-            if !push.is_empty() {
-                d.cmd_push_constants(cmd, pipe.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
-            }
-            d.cmd_dispatch(cmd, groups, groups_y, groups_z);
-            d.end_command_buffer(cmd)?;
+        // cmd recém-alocado; pipe/set válidos; push tem o tamanho do range do layout.
+        d.begin_command_buffer(cmd, &begin)?;
+        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe.pipeline);
+        d.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            pipe.layout,
+            0,
+            &[set],
+            &[],
+        );
+        if !push.is_empty() {
+            d.cmd_push_constants(cmd, pipe.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
         }
+        d.cmd_dispatch(cmd, groups, groups_y, groups_z);
+        d.end_command_buffer(cmd)?;
         let submit = vk::SubmitInfo {
             command_buffer_count: 1,
             p_command_buffers: &cmd,
             ..Default::default()
         };
-        unsafe {
-            // SAFETY: queue/submit/cmd válidos.
-            d.queue_submit(dev.queue, &[submit], vk::Fence::null())?;
-            d.queue_wait_idle(dev.queue)?;
-            d.free_command_buffers(dev.cmd_pool, &[cmd]);
-        }
+        // queue/submit/cmd válidos.
+        d.queue_submit(dev.queue, &[submit], vk::Fence::null())?;
+        d.queue_wait_idle(dev.queue)?;
+        d.free_command_buffers(dev.cmd_pool, &[cmd]);
         Ok(())
     }
 
@@ -1406,12 +1400,10 @@ impl<'ctx> ResidentForward<'ctx> {
         let d = &self.dev.device;
         let bytes = std::mem::size_of_val(data) as vk::DeviceSize;
         let staging = Buf::host(self.ctx, self.phys(), d, bytes)?;
-        unsafe {
-            // SAFETY: staging host-visible com `bytes`; ptr válido até unmap.
-            let ptr = d.map_memory(staging.mem, 0, bytes, vk::MemoryMapFlags::empty())?;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut f32, data.len());
-            d.unmap_memory(staging.mem);
-        }
+        // staging host-visible com `bytes`.
+        d.map_memory(staging.mem, 0, bytes, vk::MemoryMapFlags::empty())?
+            .escrever(data);
+        d.unmap_memory(staging.mem);
         one_shot_copy(
             d,
             self.dev.queue,
@@ -1438,14 +1430,11 @@ impl<'ctx> ResidentForward<'ctx> {
             host.buffer,
             bytes,
         )?;
-        let out = unsafe {
-            // SAFETY: host host-visible com `bytes`; ptr válido até unmap.
-            let ptr = d.map_memory(host.mem, 0, bytes, vk::MemoryMapFlags::empty())?;
-            let mut v = vec![0f32; len];
-            std::ptr::copy_nonoverlapping(ptr as *const f32, v.as_mut_ptr(), len);
-            d.unmap_memory(host.mem);
-            v
-        };
+        // host host-visible com `bytes`.
+        let out = d
+            .map_memory(host.mem, 0, bytes, vk::MemoryMapFlags::empty())?
+            .ler::<f32>(len);
+        d.unmap_memory(host.mem);
         host.destroy(d);
         Ok(out)
     }
@@ -1633,8 +1622,8 @@ impl<'ctx> ResidentForward<'ctx> {
             p_pool_sizes: pool_sizes.as_ptr(),
             ..Default::default()
         };
-        // SAFETY: d válido; pool_info aponta para dados vivos.
-        let desc_pool = unsafe { d.create_descriptor_pool(&pool_info, None)? };
+        // d válido; pool_info aponta para dados vivos.
+        let desc_pool = d.create_descriptor_pool(&pool_info, None)?;
 
         Ok(Self {
             ctx,
@@ -1899,11 +1888,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 |u: &mut crate::tensor::Uploader<'_>, data: &[f32]| -> Result<Buf, MatmulError> {
                     let bytes_val = std::mem::size_of_val(data) as vk::DeviceSize;
                     let b = Buf::device(ctx, phys, d, bytes_val)?;
-                    // SAFETY: `f32` não tem padding nem invariantes de bit; o slice de bytes
-                    // vive só até o fim desta chamada, e `bytes_para` copia na hora.
-                    let brutos = unsafe {
-                        std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), bytes_val as usize)
-                    };
+                    let brutos: &[u8] = bytemuck::cast_slice(data);
                     u.bytes_para(b.buffer, brutos)?;
                     Ok(b)
                 };
@@ -2069,16 +2054,14 @@ impl<'ctx> ResidentForward<'ctx> {
                 command_buffer_count: 1,
                 ..Default::default()
             };
-            // SAFETY: device/pool válidos; pool tem RESET_COMMAND_BUFFER.
-            let token_cmd = unsafe { dev_ref.device.allocate_command_buffers(&cb_info)? }[0];
-            let token_fence = unsafe {
-                dev_ref
-                    .device
-                    .create_fence(&vk::FenceCreateInfo::default(), None)?
-            };
+            // device/pool válidos; pool tem RESET_COMMAND_BUFFER.
+            let token_cmd = dev_ref.device.allocate_command_buffers(&cb_info)?[0];
+            let token_fence = dev_ref
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)?;
 
             // Saída deste shard: logits no último, stream residual nos demais. Mapeada uma
-            // única vez — ver `logits_ptr`.
+            // única vez — ver `logits_mapa`.
             // Nos shards intermediários a stream residual sai com um vetor por token do
             // bloco; no último só os logits do último token do bloco interessam.
             let saida_floats = if shard.is_last() {
@@ -2087,15 +2070,13 @@ impl<'ctx> ResidentForward<'ctx> {
                 config.n_embd * nblk
             };
             let logits_host = Buf::host_read(ctx, phys, d, (saida_floats * 4) as vk::DeviceSize)?;
-            // SAFETY: memória host-visible recém-criada com esse tamanho, ainda não mapeada.
-            let logits_ptr = unsafe {
-                d.map_memory(
-                    logits_host.mem,
-                    0,
-                    logits_host.size,
-                    vk::MemoryMapFlags::empty(),
-                )?
-            };
+            // Memória host-visible recém-criada com esse tamanho, ainda não mapeada.
+            let logits_mapa = d.map_memory(
+                logits_host.mem,
+                0,
+                logits_host.size,
+                vk::MemoryMapFlags::empty(),
+            )?;
 
             ResidentState {
                 cfg,
@@ -2177,7 +2158,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 },
                 // Saída deste shard: logits no último, stream residual nos demais.
                 logits_host,
-                logits_ptr,
+                logits_mapa,
                 len: RefCell::new(0),
                 snap: RefCell::new(Vec::new()),
                 snap_len: std::cell::Cell::new(None),
@@ -2240,13 +2221,12 @@ impl<'ctx> ResidentForward<'ctx> {
                     .map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?,
                 ..Default::default()
             };
-            // SAFETY: device válido; info preenchido nesta stack frame.
-            let pool = unsafe { me.dev.device.create_query_pool(&info, None)? };
-            // SAFETY: instance e handle válidos (enumerados por VulkanContext).
-            let props = unsafe {
-                ctx.instance
-                    .get_physical_device_properties(ctx.amd_compute_devices()[me.phys_idx].handle)
-            };
+            // device válido; info preenchido nesta stack frame.
+            let pool = me.dev.device.create_query_pool(&info, None)?;
+            // instance e handle válidos (enumerados por VulkanContext).
+            let props = ctx
+                .instance
+                .get_physical_device_properties(ctx.amd_compute_devices()[me.phys_idx].handle);
             Some(Prof {
                 pool,
                 host: RefCell::new([0; 3]),
@@ -2307,8 +2287,8 @@ impl<'ctx> ResidentForward<'ctx> {
                     command_buffer_count: cortes as u32,
                     ..Default::default()
                 };
-                // SAFETY: device e pool válidos; o pool tem RESET_COMMAND_BUFFER.
-                st.lote_cmds = unsafe { me.dev.device.allocate_command_buffers(&info)? };
+                // device e pool válidos; o pool tem RESET_COMMAND_BUFFER.
+                st.lote_cmds = me.dev.device.allocate_command_buffers(&info)?;
             }
         }
         me.gravar_rollback()?;
@@ -2372,22 +2352,20 @@ impl<'ctx> ResidentForward<'ctx> {
                 command_buffer_count: 1,
                 ..Default::default()
             };
-            // SAFETY: device e pool válidos; o buffer é gravado agora e resubmetido depois.
-            let cmd = unsafe { d.allocate_command_buffers(&info)? }[0];
+            // device e pool válidos; o buffer é gravado agora e resubmetido depois.
+            let cmd = d.allocate_command_buffers(&info)?[0];
             let begin = vk::CommandBufferBeginInfo::default();
-            // SAFETY: cmd recém-alocado; as cópias apontam para buffers vivos no state.
-            unsafe {
-                d.begin_command_buffer(cmd, &begin)?;
-                for (src, dst, size) in &copias {
-                    let region = vk::BufferCopy {
-                        src_offset: 0,
-                        dst_offset: 0,
-                        size: *size,
-                    };
-                    d.cmd_copy_buffer(cmd, *src, *dst, &[region]);
-                }
-                d.end_command_buffer(cmd)?;
+            // cmd recém-alocado; as cópias apontam para buffers vivos no state.
+            d.begin_command_buffer(cmd, &begin)?;
+            for (src, dst, size) in &copias {
+                let region = vk::BufferCopy {
+                    src_offset: 0,
+                    dst_offset: 0,
+                    size: *size,
+                };
+                d.cmd_copy_buffer(cmd, *src, *dst, &[region]);
             }
+            d.end_command_buffer(cmd)?;
             cmds.push(cmd);
         }
         if let Some(st) = self.state.as_mut() {
@@ -2454,6 +2432,7 @@ impl<'ctx> ResidentForward<'ctx> {
         if head_dim > 256 {
             return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
         }
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
         #[repr(C)]
         struct P {
             n_head: u32,
@@ -2507,7 +2486,7 @@ impl<'ctx> ResidentForward<'ctx> {
             // Cabeças contíguas neste helper de teste.
             q_stride: head_dim as u32,
         };
-        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 28) };
+        let pb = &bytemuck::bytes_of(&push)[..28];
         self.dispatch_xy(
             &self.attention,
             set,
@@ -2547,6 +2526,7 @@ impl<'ctx> ResidentForward<'ctx> {
         if head_dim > 256 || n_split == 0 {
             return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
         }
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
         #[repr(C)]
         struct P {
             n_head: u32,
@@ -2557,6 +2537,7 @@ impl<'ctx> ResidentForward<'ctx> {
             kv_layer_off: u32,
             q_stride: u32,
         }
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
         #[repr(C)]
         struct R {
             n_head: u32,
@@ -2591,8 +2572,7 @@ impl<'ctx> ResidentForward<'ctx> {
             kv_layer_off: 0,
             q_stride: head_dim as u32,
         };
-        // SAFETY: P é #[repr(C)] de 7 u32 contíguos; 28 bytes é o push range da pipeline.
-        let pb = unsafe { std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), 28) };
+        let pb = &bytemuck::bytes_of(&push)[..28];
         let pipe = self.pipe_split(head_dim);
         let set = self.alloc_set(pipe)?;
         self.dispatch_xyz(
@@ -2615,8 +2595,7 @@ impl<'ctx> ResidentForward<'ctx> {
             head_dim: head_dim as u32,
             n_split: n_split as u32,
         };
-        // SAFETY: R é #[repr(C)] de 3 u32; 12 bytes é o push range da pipeline.
-        let rb = unsafe { std::slice::from_raw_parts(std::ptr::from_ref(&red).cast::<u8>(), 12) };
+        let rb = &bytemuck::bytes_of(&red)[..12];
         let set_r = self.alloc_set(&self.attn_reduce)?;
         self.dispatch_xy(
             &self.attn_reduce,
@@ -2654,6 +2633,7 @@ impl<'ctx> ResidentForward<'ctx> {
         n_split: usize,
         reps: usize,
     ) -> Result<f64, MatmulError> {
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
         #[repr(C)]
         struct P {
             n_head: u32,
@@ -2692,8 +2672,7 @@ impl<'ctx> ResidentForward<'ctx> {
             kv_layer_off: 0,
             q_stride: head_dim as u32,
         };
-        // SAFETY: P é #[repr(C)] de 7 u32; 28 bytes é o push range das duas pipelines.
-        let pb = unsafe { std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), 28) };
+        let pb = &bytemuck::bytes_of(&push)[..28];
         let usa_split = n_split > 1;
         let pipe = if usa_split {
             self.pipe_split(head_dim)
@@ -3316,6 +3295,7 @@ impl<'ctx> ResidentForward<'ctx> {
     }
 
     pub fn dbg_add(&self, dst: &[f32], src: &[f32]) -> Result<Vec<f32>, MatmulError> {
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
         #[repr(C)]
         struct P {
             n: u32,
@@ -3338,7 +3318,7 @@ impl<'ctx> ResidentForward<'ctx> {
         self.upload_f32(&sb, src)?;
         let set = self.alloc_set(&self.add)?;
         let push = P { n: n as u32 };
-        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 4) };
+        let pb = &bytemuck::bytes_of(&push)[..4];
         self.dispatch1(
             &self.add,
             set,
@@ -3354,6 +3334,7 @@ impl<'ctx> ResidentForward<'ctx> {
 
     /// Diagnóstico: roda só o shader rmsnorm sobre `x`,`w` e devolve a saída ao host.
     pub fn dbg_rmsnorm(&self, x: &[f32], w: &[f32], eps: f32) -> Result<Vec<f32>, MatmulError> {
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
         #[repr(C)]
         struct P {
             dim: u32,
@@ -3381,9 +3362,7 @@ impl<'ctx> ResidentForward<'ctx> {
             dim: dim as u32,
             eps,
         };
-        let push_bytes = unsafe {
-            std::slice::from_raw_parts(&push as *const P as *const u8, std::mem::size_of::<P>())
-        };
+        let push_bytes = bytemuck::bytes_of(&push);
         self.dispatch1(
             &self.rmsnorm,
             set,
@@ -3429,6 +3408,7 @@ impl<'ctx> ResidentForward<'ctx> {
         pos: usize,
         n_tok: u32,
     ) -> Result<Vec<f32>, MatmulError> {
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
         #[repr(C)]
         struct P {
             n_head: u32,
@@ -3461,7 +3441,7 @@ impl<'ctx> ResidentForward<'ctx> {
             // Cabeças contíguas neste helper de teste.
             stride: head_dim as u32,
         };
-        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 20) };
+        let pb = &bytemuck::bytes_of(&push)[..20];
         let pairs = n_head * (rope_dim / 2);
         self.dispatch_xy(
             &self.rope,
@@ -3581,6 +3561,7 @@ impl<'ctx> ResidentForward<'ctx> {
         let bytes: Vec<u8> = match push {
             PushSpec::Static(b) => b.clone(),
             PushSpec::Rope { n_head, stride } => {
+                #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
                 #[repr(C)]
                 struct P {
                     n_head: u32,
@@ -3596,9 +3577,10 @@ impl<'ctx> ResidentForward<'ctx> {
                     pos: pos as f32,
                     stride: *stride,
                 };
-                unsafe { std::slice::from_raw_parts(&pp as *const P as *const u8, 20) }.to_vec()
+                bytemuck::bytes_of(&pp)[..20].to_vec()
             }
             PushSpec::KvPack { slot, n_tok } => {
+                #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
                 #[repr(C)]
                 struct P {
                     n_pares: u32,
@@ -3612,10 +3594,10 @@ impl<'ctx> ResidentForward<'ctx> {
                     n_pares: (c.kv_dim / 2 * *n_tok as usize) as u32,
                     dst_par: ((*slot as usize * c.ctx + pos0) * c.kv_dim / 2) as u32,
                 };
-                // SAFETY: P é #[repr(C)] de 2 palavras de 32 bits; 8 bytes é o push range.
-                unsafe { std::slice::from_raw_parts(&pp as *const P as *const u8, 8) }.to_vec()
+                bytemuck::bytes_of(&pp)[..8].to_vec()
             }
             PushSpec::Attention { kv_layer_off } => {
+                #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
                 #[repr(C)]
                 struct P {
                     n_head: u32,
@@ -3640,9 +3622,10 @@ impl<'ctx> ResidentForward<'ctx> {
                         c.head_dim as u32
                     },
                 };
-                unsafe { std::slice::from_raw_parts(&pp as *const P as *const u8, 28) }.to_vec()
+                bytemuck::bytes_of(&pp)[..28].to_vec()
             }
             PushSpec::AttnReduce => {
+                #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
                 #[repr(C)]
                 struct R {
                     n_head: u32,
@@ -3654,24 +3637,21 @@ impl<'ctx> ResidentForward<'ctx> {
                     head_dim: c.head_dim as u32,
                     n_split,
                 };
-                // SAFETY: R é #[repr(C)] de 3 u32; 12 bytes é o push range da pipeline.
-                unsafe { std::slice::from_raw_parts(&rr as *const R as *const u8, 12) }.to_vec()
+                bytemuck::bytes_of(&rr)[..12].to_vec()
             }
         };
-        // SAFETY: cmd em gravação; pipeline/set válidos; bytes do tamanho do range.
-        unsafe {
-            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.pipeline);
-            d.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                p.layout,
-                0,
-                &[*set],
-                &[],
-            );
-            d.cmd_push_constants(cmd, p.layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
-            d.cmd_dispatch(cmd, *groups, *groups_y, groups_z);
-        }
+        // cmd em gravação; pipeline/set válidos; bytes do tamanho do range.
+        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.pipeline);
+        d.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            p.layout,
+            0,
+            &[*set],
+            &[],
+        );
+        d.cmd_push_constants(cmd, p.layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+        d.cmd_dispatch(cmd, *groups, *groups_y, groups_z);
     }
 
     /// Barreira de memória global entre dispatches/cópias do mesmo command buffer.
@@ -3682,18 +3662,16 @@ impl<'ctx> ResidentForward<'ctx> {
             ..Default::default()
         };
         let stage = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
-        // SAFETY: cmd em gravação; barreira global sem buffer/image barriers.
-        unsafe {
-            self.dev.device.cmd_pipeline_barrier(
-                cmd,
-                stage,
-                stage,
-                vk::DependencyFlags::empty(),
-                &[mb],
-                &[],
-                &[],
-            );
-        }
+        // cmd em gravação; barreira global sem buffer/image barriers.
+        self.dev.device.cmd_pipeline_barrier(
+            cmd,
+            stage,
+            stage,
+            vk::DependencyFlags::empty(),
+            &[mb],
+            &[],
+            &[],
+        );
     }
 
     /// Fecha `cmd`, submete sem fence e abre `prox` com uma barreira — o que vier gravado
@@ -3715,18 +3693,16 @@ impl<'ctx> ResidentForward<'ctx> {
             p_command_buffers: &cmd,
             ..Default::default()
         };
-        // SAFETY: cmd em gravação; `prox` não está na GPU (o fence do passo anterior, que
+        // cmd em gravação; `prox` não está na GPU (o fence do passo anterior, que
         // cobre todos os submits dele, foi aguardado) e o pool tem RESET_COMMAND_BUFFER.
-        unsafe {
-            d.end_command_buffer(cmd)?;
-            d.queue_submit(self.dev.queue, &[submit], vk::Fence::null())?;
-            d.reset_command_buffer(prox, vk::CommandBufferResetFlags::empty())?;
-            let begin = vk::CommandBufferBeginInfo {
-                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
-                ..Default::default()
-            };
-            d.begin_command_buffer(prox, &begin)?;
-        }
+        d.end_command_buffer(cmd)?;
+        d.queue_submit(self.dev.queue, &[submit], vk::Fence::null())?;
+        d.reset_command_buffer(prox, vk::CommandBufferResetFlags::empty())?;
+        let begin = vk::CommandBufferBeginInfo {
+            flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+            ..Default::default()
+        };
+        d.begin_command_buffer(prox, &begin)?;
         self.full_barrier(prox);
         Ok(prox)
     }
@@ -3776,11 +3752,9 @@ impl<'ctx> ResidentForward<'ctx> {
         // Timestamp inicial (slot 0); cada op grava o seu em slot i+1.
         if let Some(pf) = prof {
             let n = (plan.len() + 1) as u32;
-            // SAFETY: cmd em gravação; pool criado com 1024 slots >= n.
-            unsafe {
-                d.cmd_reset_query_pool(cmd, pf.pool, 0, n);
-                d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, pf.pool, 0);
-            }
+            // cmd em gravação; pool criado com 1024 slots >= n.
+            d.cmd_reset_query_pool(cmd, pf.pool, 0, n);
+            d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, pf.pool, 0);
         }
 
         let mut reserva = st.lote_cmds.iter();
@@ -3810,22 +3784,13 @@ impl<'ctx> ResidentForward<'ctx> {
                         _ => None,
                     };
                     if let Some(src) = x_in.or(linhas.as_deref()) {
-                        // SAFETY: embd_stage é host-visible/coherent com `bytes`;
-                        // o ponteiro é válido até unmap e a cópia respeita n_embd floats.
-                        unsafe {
-                            if let Ok(ptr) = d.map_memory(
-                                st.embd_stage.mem,
-                                0,
-                                bytes,
-                                vk::MemoryMapFlags::empty(),
-                            ) {
-                                std::ptr::copy_nonoverlapping(
-                                    src.as_ptr(),
-                                    ptr as *mut f32,
-                                    c.n_embd * n_tok,
-                                );
-                                d.unmap_memory(st.embd_stage.mem);
-                            }
+                        // embd_stage é host-visible/coherent com `bytes`; a cópia respeita
+                        // n_embd floats.
+                        if let Ok(mut mapa) =
+                            d.map_memory(st.embd_stage.mem, 0, bytes, vk::MemoryMapFlags::empty())
+                        {
+                            mapa.escrever(&src[..c.n_embd * n_tok]);
+                            d.unmap_memory(st.embd_stage.mem);
                         }
                     }
                     let region = vk::BufferCopy {
@@ -3833,10 +3798,8 @@ impl<'ctx> ResidentForward<'ctx> {
                         dst_offset: 0,
                         size: bytes,
                     };
-                    // SAFETY: cmd em gravação; buffers vivos; offsets dentro do tamanho.
-                    unsafe {
-                        d.cmd_copy_buffer(cmd, st.embd_stage.buffer, st.b_x.buffer, &[region]);
-                    }
+                    // cmd em gravação; buffers vivos; offsets dentro do tamanho.
+                    d.cmd_copy_buffer(cmd, st.embd_stage.buffer, st.b_x.buffer, &[region]);
                 }
                 PlannedOp::Copia { src, dst, bytes } => {
                     let region = vk::BufferCopy {
@@ -3844,9 +3807,9 @@ impl<'ctx> ResidentForward<'ctx> {
                         dst_offset: 0,
                         size: *bytes,
                     };
-                    // SAFETY: cmd em gravação; os dois buffers vivem no state, e `bytes`
+                    // cmd em gravação; os dois buffers vivem no state, e `bytes`
                     // é o tamanho do menor deles (fixado na construção do plano).
-                    unsafe { d.cmd_copy_buffer(cmd, *src, *dst, &[region]) };
+                    d.cmd_copy_buffer(cmd, *src, *dst, &[region]);
                 }
                 // Só o plano da cabeça MTP a usa — ver `record_mtp`.
                 PlannedOp::CopiaHidden => {}
@@ -3892,15 +3855,13 @@ impl<'ctx> ResidentForward<'ctx> {
                 }
             }
             if let Some(pf) = prof {
-                // SAFETY: cmd em gravação; o pool foi dimensionado com plan.len()+1 slots.
-                unsafe {
-                    d.cmd_write_timestamp(
-                        cmd,
-                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                        pf.pool,
-                        (op_idx + 1) as u32,
-                    );
-                }
+                // cmd em gravação; o pool foi dimensionado com plan.len()+1 slots.
+                d.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    pf.pool,
+                    (op_idx + 1) as u32,
+                );
             }
         }
 
@@ -3930,10 +3891,8 @@ impl<'ctx> ResidentForward<'ctx> {
             dst_offset: 0,
             size: (n_out * 4) as vk::DeviceSize,
         };
-        // SAFETY: cmd em gravação; ambos os buffers vivem no state.
-        unsafe {
-            d.cmd_copy_buffer(cmd, src.buffer, st.logits_host.buffer, &[region]);
-        }
+        // cmd em gravação; ambos os buffers vivem no state.
+        d.cmd_copy_buffer(cmd, src.buffer, st.logits_host.buffer, &[region]);
         Ok(cmd)
     }
 
@@ -3964,8 +3923,8 @@ impl<'ctx> ResidentForward<'ctx> {
                         dst_offset: 0,
                         size: *bytes,
                     };
-                    // SAFETY: cmd em gravação; buffers vivos no state.
-                    unsafe { d.cmd_copy_buffer(cmd, *src, *dst, &[region]) };
+                    // cmd em gravação; buffers vivos no state.
+                    d.cmd_copy_buffer(cmd, *src, *dst, &[region]);
                 }
                 PlannedOp::CopiaHidden => {
                     // Com `HIDDEN_CABECA` a origem é o residual do próprio bloco MTP da
@@ -3982,9 +3941,9 @@ impl<'ctx> ResidentForward<'ctx> {
                         dst_offset: 0,
                         size: (c.n_embd * 4) as vk::DeviceSize,
                     };
-                    // SAFETY: `b_x` cobre `n_embd * nblk` floats e `hidden_idx` é menor
+                    // `b_x` cobre `n_embd * nblk` floats e `hidden_idx` é menor
                     // que o bloco do último passo (ou o sentinel, que lê `m.b_x` em 0).
-                    unsafe { d.cmd_copy_buffer(cmd, src, m.b_h.buffer, &[region]) };
+                    d.cmd_copy_buffer(cmd, src, m.b_h.buffer, &[region]);
                 }
                 PlannedOp::Atencao {
                     curto,
@@ -4011,10 +3970,8 @@ impl<'ctx> ResidentForward<'ctx> {
             dst_offset: 0,
             size: (c.vocab * 4) as vk::DeviceSize,
         };
-        // SAFETY: cmd em gravação; `logits_host` tem pelo menos `vocab` floats.
-        unsafe {
-            d.cmd_copy_buffer(cmd, st.b_logits.buffer, st.logits_host.buffer, &[region]);
-        }
+        // cmd em gravação; `logits_host` tem pelo menos `vocab` floats.
+        d.cmd_copy_buffer(cmd, st.b_logits.buffer, st.logits_host.buffer, &[region]);
     }
 
     /// A linha de embedding de `token`, quando este shard carrega a tabela (o primeiro).
@@ -4053,23 +4010,21 @@ impl<'ctx> ResidentForward<'ctx> {
         }
         let d = &self.dev.device;
         let bytes = (st.cfg.n_embd * 4) as vk::DeviceSize;
-        // SAFETY: `emb_stage` é host-visible/coherent com `n_embd` floats.
-        unsafe {
-            let ptr = d.map_memory(m.emb_stage.mem, 0, bytes, vk::MemoryMapFlags::empty())?;
-            std::ptr::copy_nonoverlapping(emb.as_ptr(), ptr.cast::<f32>(), st.cfg.n_embd);
+        // `emb_stage` é host-visible/coherent com `n_embd` floats.
+        {
+            d.map_memory(m.emb_stage.mem, 0, bytes, vk::MemoryMapFlags::empty())?
+                .escrever(&emb[..st.cfg.n_embd]);
             d.unmap_memory(m.emb_stage.mem);
         }
 
         let cmd = st.token_cmd;
-        // SAFETY: pool com RESET_COMMAND_BUFFER; o fence do passo anterior já foi aguardado.
-        unsafe {
-            d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-            let begin = vk::CommandBufferBeginInfo {
-                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
-                ..Default::default()
-            };
-            d.begin_command_buffer(cmd, &begin)?;
-        }
+        // pool com RESET_COMMAND_BUFFER; o fence do passo anterior já foi aguardado.
+        d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+        let begin = vk::CommandBufferBeginInfo {
+            flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+            ..Default::default()
+        };
+        d.begin_command_buffer(cmd, &begin)?;
         self.record_mtp(cmd, hidden_idx);
         if let Some(p) = &self.pstate {
             p.em_uso(false);
@@ -4079,20 +4034,18 @@ impl<'ctx> ResidentForward<'ctx> {
             p_command_buffers: &cmd,
             ..Default::default()
         };
-        // SAFETY: cmd em gravação, fence resetado antes do submit.
-        unsafe {
-            d.end_command_buffer(cmd)?;
-            d.reset_fences(&[st.token_fence])?;
-            d.queue_submit(self.dev.queue, &[submit], st.token_fence)?;
-        }
+        // cmd em gravação, fence resetado antes do submit.
+        d.end_command_buffer(cmd)?;
+        d.reset_fences(&[st.token_fence])?;
+        d.queue_submit(self.dev.queue, &[submit], st.token_fence)?;
         self.espera_fence(st)?;
         *m.len.borrow_mut() += 1;
 
         // Argmax no host, sobre o mapa persistente de `logits_host`. A cabeça é greedy por
         // construção: ela propõe um candidato, e quem decide é a verificação.
-        // SAFETY: host-coherent, a cópia terminou (fence aguardado) e o mapa cobre `vocab`.
-        let logits =
-            unsafe { std::slice::from_raw_parts(st.logits_ptr.cast::<f32>(), st.cfg.vocab) };
+        // Host-coherent, a cópia terminou (fence aguardado) e o mapa cobre `vocab`.
+        let logits: &[f32] =
+            bytemuck::cast_slice(&st.logits_mapa.bytes()[..st.cfg.vocab * size_of::<f32>()]);
         let mut melhor = 0usize;
         let mut valor = f32::NEG_INFINITY;
         for (i, &x) in logits.iter().enumerate() {
@@ -4237,8 +4190,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 ..Default::default()
             })
             .collect();
-        // SAFETY: d válido; writes apontam para buf_infos vivos; set nunca em uso durante o build.
-        unsafe { d.update_descriptor_sets(&writes, &[]) };
+        // d válido; writes apontam para buf_infos vivos; set nunca em uso durante o build.
+        d.update_descriptor_sets(&writes, &[]);
         let (le_idx, esc_idx) = pipe.acessos();
         let faixas = |idx: &[usize]| -> Vec<Faixa> {
             idx.iter().filter_map(|&i| binds.get(i).copied()).collect()
@@ -4292,12 +4245,13 @@ impl<'ctx> ResidentForward<'ctx> {
         let mut plan = Vec::new();
 
         let n_push = |n: usize| -> Vec<u8> {
+            #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
             #[repr(C)]
             struct P {
                 n: u32,
             }
             let p = P { n: n as u32 };
-            unsafe { std::slice::from_raw_parts(&p as *const P as *const u8, 4) }.to_vec()
+            bytemuck::bytes_of(&p)[..4].to_vec()
         };
         let mv_push = |n_in: usize, n_out: usize| -> Vec<u8> {
             let p = PushConstants {
@@ -4308,13 +4262,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 // binding 4 é preenchido só para completar o layout.
                 tem_bias: 0,
             };
-            unsafe {
-                std::slice::from_raw_parts(
-                    &p as *const PushConstants as *const u8,
-                    std::mem::size_of::<PushConstants>(),
-                )
-            }
-            .to_vec()
+            bytemuck::bytes_of(&p).to_vec()
         };
         // Linhas que um workgroup do Q5_K cobre — tem de casar com as spec constants da
         // pipeline **deste plano**, senão sobram ou faltam workgroups. O bloco de prefill
@@ -4332,7 +4280,7 @@ impl<'ctx> ResidentForward<'ctx> {
         // Push do quantize: n_in + 2 pads (o range declarado no pipeline e de 12 bytes).
         let qx_push = |n_in: usize| -> Vec<u8> {
             let p: [u32; 3] = [n_in as u32, 0, 0];
-            unsafe { std::slice::from_raw_parts(p.as_ptr().cast::<u8>(), 12) }.to_vec()
+            bytemuck::bytes_of(&p).to_vec()
         };
         let qx_groups = |n_in: usize| -> u32 { ((n_in / 32) as u32).div_ceil(64) };
         // Workgroups do passo 1 da norma: um por 256 elementos, até o teto.
@@ -5172,14 +5120,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 row_offset: 0,
                 tem_bias: 0,
             };
-            // SAFETY: PushConstants é #[repr(C)] de 4 u32; lemos exatamente o seu tamanho.
-            let push = unsafe {
-                std::slice::from_raw_parts(
-                    std::ptr::from_ref(&p).cast::<u8>(),
-                    std::mem::size_of::<PushConstants>(),
-                )
-            }
-            .to_vec();
+            let push = bytemuck::bytes_of(&p).to_vec();
             self.mk_op(
                 pipe,
                 &[
@@ -5239,8 +5180,7 @@ impl<'ctx> ResidentForward<'ctx> {
         };
         let quantiza = |src: &Buf, n: usize| -> Result<PlannedOp, MatmulError> {
             let p: [u32; 3] = [u(n), 0, 0];
-            // SAFETY: três u32 contíguos; 12 bytes é o push range da pipeline.
-            let push = unsafe { std::slice::from_raw_parts(p.as_ptr().cast::<u8>(), 12) }.to_vec();
+            let push = bytemuck::bytes_of(&p).to_vec();
             self.mk_op(
                 PipeId::QuantizeX,
                 &[
@@ -5519,15 +5459,13 @@ impl<'ctx> ResidentForward<'ctx> {
         };
         let n = plano.len() + 1;
         let mut ticks = vec![0u64; n];
-        // SAFETY: pool tem >= n slots, todos escritos neste command buffer já concluído.
-        unsafe {
-            self.dev.device.get_query_pool_results(
-                pf.pool,
-                0,
-                &mut ticks,
-                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
-            )?;
-        }
+        // pool tem >= n slots, todos escritos neste command buffer já concluído.
+        self.dev.device.get_query_pool_results(
+            pf.pool,
+            0,
+            &mut ticks,
+            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+        )?;
         let mut accum = match modo {
             Modo::Decode => pf.accum.borrow_mut(),
             Modo::Batch => pf.accum_batch.borrow_mut(),
@@ -5782,12 +5720,10 @@ impl<'ctx> ResidentForward<'ctx> {
             p_command_buffers: &cmd,
             ..Default::default()
         };
-        // SAFETY: o command buffer foi gravado uma vez na construção e não usa
+        // o command buffer foi gravado uma vez na construção e não usa
         // ONE_TIME_SUBMIT; o fence do token já foi aguardado antes desta chamada.
-        unsafe {
-            d.reset_fences(&[st.token_fence])?;
-            d.queue_submit(self.dev.queue, &[submit], st.token_fence)?;
-        }
+        d.reset_fences(&[st.token_fence])?;
+        d.queue_submit(self.dev.queue, &[submit], st.token_fence)?;
         self.espera_fence(st)
     }
 
@@ -6025,47 +5961,45 @@ impl<'ctx> ResidentForward<'ctx> {
             return true;
         }
         let d = &self.dev.device;
-        // SAFETY: GPU ociosa entre sequências; buffers criados por nós, com tamanhos iguais.
-        unsafe {
-            let _ = d.device_wait_idle();
-            let cb_info = vk::CommandBufferAllocateInfo {
-                command_pool: self.dev.cmd_pool,
-                level: vk::CommandBufferLevel::PRIMARY,
-                command_buffer_count: 1,
-                ..Default::default()
-            };
-            let Ok(cbs) = d.allocate_command_buffers(&cb_info) else {
-                return false;
-            };
-            let cmd = cbs[0];
-            let begin = vk::CommandBufferBeginInfo {
-                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
-                ..Default::default()
-            };
-            let mut ok = false;
-            if d.begin_command_buffer(cmd, &begin).is_ok() {
-                for (src, dst) in pares {
-                    let region = vk::BufferCopy {
-                        src_offset: 0,
-                        dst_offset: 0,
-                        size: src.size.min(dst.size),
-                    };
-                    d.cmd_copy_buffer(cmd, src.buffer, dst.buffer, &[region]);
-                }
-                ok = d.end_command_buffer(cmd).is_ok();
-                let submit = vk::SubmitInfo {
-                    command_buffer_count: 1,
-                    p_command_buffers: &cmd,
-                    ..Default::default()
+        // GPU ociosa entre sequências; buffers criados por nós, com tamanhos iguais.
+        let _ = d.device_wait_idle();
+        let cb_info = vk::CommandBufferAllocateInfo {
+            command_pool: self.dev.cmd_pool,
+            level: vk::CommandBufferLevel::PRIMARY,
+            command_buffer_count: 1,
+            ..Default::default()
+        };
+        let Ok(cbs) = d.allocate_command_buffers(&cb_info) else {
+            return false;
+        };
+        let cmd = cbs[0];
+        let begin = vk::CommandBufferBeginInfo {
+            flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+            ..Default::default()
+        };
+        let mut ok = false;
+        if d.begin_command_buffer(cmd, &begin).is_ok() {
+            for (src, dst) in pares {
+                let region = vk::BufferCopy {
+                    src_offset: 0,
+                    dst_offset: 0,
+                    size: src.size.min(dst.size),
                 };
-                ok &= d
-                    .queue_submit(self.dev.queue, &[submit], vk::Fence::null())
-                    .is_ok();
-                ok &= d.queue_wait_idle(self.dev.queue).is_ok();
+                d.cmd_copy_buffer(cmd, src.buffer, dst.buffer, &[region]);
             }
-            d.free_command_buffers(self.dev.cmd_pool, &cbs);
-            ok
+            ok = d.end_command_buffer(cmd).is_ok();
+            let submit = vk::SubmitInfo {
+                command_buffer_count: 1,
+                p_command_buffers: &cmd,
+                ..Default::default()
+            };
+            ok &= d
+                .queue_submit(self.dev.queue, &[submit], vk::Fence::null())
+                .is_ok();
+            ok &= d.queue_wait_idle(self.dev.queue).is_ok();
         }
+        d.free_command_buffers(self.dev.cmd_pool, &cbs);
+        ok
     }
 
     /// Zera o comprimento do KV-cache (início de nova sequência).
@@ -6098,38 +6032,36 @@ impl<'ctx> ResidentForward<'ctx> {
                 .filter_map(|la| la.delta.as_ref())
                 .flat_map(|dn| [dn.estado.size, dn.janela.size])
                 .collect();
-            // SAFETY: GPU ociosa entre sequências; buffers criados por nós.
-            unsafe {
-                let _ = d.device_wait_idle();
-                let cb_info = vk::CommandBufferAllocateInfo {
-                    command_pool: self.dev.cmd_pool,
-                    level: vk::CommandBufferLevel::PRIMARY,
-                    command_buffer_count: 1,
-                    ..Default::default()
-                };
-                let Ok(cbs) = d.allocate_command_buffers(&cb_info) else {
-                    return;
-                };
-                let cmd = cbs[0];
-                let begin = vk::CommandBufferBeginInfo {
-                    flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
-                    ..Default::default()
-                };
-                if d.begin_command_buffer(cmd, &begin).is_ok() {
-                    for (buf, size) in zerar.iter().zip(&tamanhos) {
-                        d.cmd_fill_buffer(cmd, *buf, 0, *size, 0);
-                    }
-                    let _ = d.end_command_buffer(cmd);
-                    let submit = vk::SubmitInfo {
-                        command_buffer_count: 1,
-                        p_command_buffers: &cmd,
-                        ..Default::default()
-                    };
-                    let _ = d.queue_submit(self.dev.queue, &[submit], vk::Fence::null());
-                    let _ = d.queue_wait_idle(self.dev.queue);
+            // GPU ociosa entre sequências; buffers criados por nós.
+            let _ = d.device_wait_idle();
+            let cb_info = vk::CommandBufferAllocateInfo {
+                command_pool: self.dev.cmd_pool,
+                level: vk::CommandBufferLevel::PRIMARY,
+                command_buffer_count: 1,
+                ..Default::default()
+            };
+            let Ok(cbs) = d.allocate_command_buffers(&cb_info) else {
+                return;
+            };
+            let cmd = cbs[0];
+            let begin = vk::CommandBufferBeginInfo {
+                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                ..Default::default()
+            };
+            if d.begin_command_buffer(cmd, &begin).is_ok() {
+                for (buf, size) in zerar.iter().zip(&tamanhos) {
+                    d.cmd_fill_buffer(cmd, *buf, 0, *size, 0);
                 }
-                d.free_command_buffers(self.dev.cmd_pool, &cbs);
+                let _ = d.end_command_buffer(cmd);
+                let submit = vk::SubmitInfo {
+                    command_buffer_count: 1,
+                    p_command_buffers: &cmd,
+                    ..Default::default()
+                };
+                let _ = d.queue_submit(self.dev.queue, &[submit], vk::Fence::null());
+                let _ = d.queue_wait_idle(self.dev.queue);
             }
+            d.free_command_buffers(self.dev.cmd_pool, &cbs);
         }
     }
 
@@ -6144,8 +6076,8 @@ impl<'ctx> ResidentForward<'ctx> {
         let d = &self.dev.device;
         let t0 = std::time::Instant::now();
         loop {
-            // SAFETY: fence válido e submetido.
-            if unsafe { d.get_fence_status(st.token_fence)? } {
+            // fence válido e submetido.
+            if d.get_fence_status(st.token_fence)? {
                 return Ok(());
             }
             // Um submit que passa do limite do driver (2 s no ring gfx, ver `cortar_submit`)
@@ -6196,25 +6128,21 @@ impl<'ctx> ResidentForward<'ctx> {
         let dev = &self.dev;
         let cmd = st.token_cmd;
 
-        // SAFETY: pool RESET_COMMAND_BUFFER; cmd não está em uso (fence do token anterior aguardado).
-        unsafe {
-            d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-            let begin = vk::CommandBufferBeginInfo {
-                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
-                ..Default::default()
-            };
-            d.begin_command_buffer(cmd, &begin)?;
-        }
+        // pool RESET_COMMAND_BUFFER; cmd não está em uso (fence do token anterior aguardado).
+        d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+        let begin = vk::CommandBufferBeginInfo {
+            flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+            ..Default::default()
+        };
+        d.begin_command_buffer(cmd, &begin)?;
         // Antes da gravação: no prefill o primeiro submit sai de dentro dela.
         if let Some(p) = &self.pstate {
             p.em_uso(modo == Modo::Batch);
         }
         let t0 = std::time::Instant::now();
         let cmd = self.record_token(cmd, tokens, pos, x_in, modo)?;
-        // SAFETY: cmd em gravação.
-        unsafe {
-            d.end_command_buffer(cmd)?;
-        }
+        // cmd em gravação.
+        d.end_command_buffer(cmd)?;
         let t_rec = t0.elapsed();
         let t1 = std::time::Instant::now();
 
@@ -6223,11 +6151,9 @@ impl<'ctx> ResidentForward<'ctx> {
             p_command_buffers: &cmd,
             ..Default::default()
         };
-        // SAFETY: fence resetado antes do submit; cmd válido.
-        unsafe {
-            d.reset_fences(&[st.token_fence])?;
-            d.queue_submit(dev.queue, &[submit], st.token_fence)?;
-        }
+        // fence resetado antes do submit; cmd válido.
+        d.reset_fences(&[st.token_fence])?;
+        d.queue_submit(dev.queue, &[submit], st.token_fence)?;
         self.em_voo.set(true);
         self.t_submit.set(Some(t1));
         if let Some(pf) = &st.prof {
@@ -6269,16 +6195,10 @@ impl<'ctx> ResidentForward<'ctx> {
         // a cada token são dois ioctls no caminho crítico, e o vocabulário do 32B faz esse
         // caminho rodar com 608 KB.
         //
-        // `Vec::with_capacity` + `set_len` em vez de `vec![0.0; len]`: o segundo zera os
-        // 608 KB (calloc) só para a cópia logo abaixo sobrescrever tudo.
-        let out = unsafe {
-            let mut v = Vec::<f32>::with_capacity(len);
-            // SAFETY: logits_host é host-coherent e a cópia já terminou (fence aguardado
-            // acima); `v` tem capacidade para `len` f32, escritos antes do set_len.
-            std::ptr::copy_nonoverlapping(st.logits_ptr.cast::<f32>(), v.as_mut_ptr(), len);
-            v.set_len(len);
-            v
-        };
+        // `Mapa::ler` copia sem zerar antes: `vec![0.0; len]` zeraria os 608 KB (calloc)
+        // só para a cópia sobrescrever tudo. logits_host é host-coherent e a cópia já
+        // terminou (fence aguardado acima).
+        let out = st.logits_mapa.ler::<f32>(len);
         if let Some(pf) = &st.prof {
             let mut h = pf.host.borrow_mut();
             h[1] += t_sub.as_nanos() as u64;
@@ -6360,17 +6280,14 @@ impl llama_model::GpuResidentDecode for ResidentForward<'_> {
 impl Drop for ResidentForward<'_> {
     fn drop(&mut self) {
         let d = &self.dev.device;
-        // SAFETY: GPU ociosa antes de liberar.
-        unsafe {
-            let _ = d.device_wait_idle();
-        }
-
+        // GPU ociosa antes de liberar.
+        let _ = d.device_wait_idle();
         if let Some(st) = self.state.take() {
-            // SAFETY: mapeada uma vez na construção e nunca desmapeada até aqui.
-            unsafe { d.unmap_memory(st.logits_host.mem) };
+            // mapeada uma vez na construção e nunca desmapeada até aqui.
+            d.unmap_memory(st.logits_host.mem);
             if let Some(pf) = &st.prof {
-                // SAFETY: pool criado por nós; GPU ociosa (device_wait_idle acima).
-                unsafe { d.destroy_query_pool(pf.pool, None) };
+                // pool criado por nós; GPU ociosa (device_wait_idle acima).
+                d.destroy_query_pool(pf.pool, None);
             }
             for lq in st.qw {
                 match lq.mixer {
@@ -6503,23 +6420,19 @@ impl Drop for ResidentForward<'_> {
             // Os chunks dos pesos por último: os buffers acima apontavam para dentro deles.
             let mut pesos_mem = st.pesos_mem;
             pesos_mem.cleanup(d);
-            // SAFETY: token_cmd/token_fence criados por nós; GPU ociosa.
-            unsafe {
-                d.free_command_buffers(self.dev.cmd_pool, &[st.token_cmd]);
-                if !st.rollback_cmds.is_empty() {
-                    d.free_command_buffers(self.dev.cmd_pool, &st.rollback_cmds);
-                }
-                if !st.lote_cmds.is_empty() {
-                    d.free_command_buffers(self.dev.cmd_pool, &st.lote_cmds);
-                }
-                d.destroy_fence(st.token_fence, None);
+            // token_cmd/token_fence criados por nós; GPU ociosa.
+            d.free_command_buffers(self.dev.cmd_pool, &[st.token_cmd]);
+            if !st.rollback_cmds.is_empty() {
+                d.free_command_buffers(self.dev.cmd_pool, &st.rollback_cmds);
             }
+            if !st.lote_cmds.is_empty() {
+                d.free_command_buffers(self.dev.cmd_pool, &st.lote_cmds);
+            }
+            d.destroy_fence(st.token_fence, None);
         }
 
-        // SAFETY: pool/pipelines criados por nós.
-        unsafe {
-            d.destroy_descriptor_pool(self.desc_pool, None);
-        }
+        // pool/pipelines criados por nós.
+        d.destroy_descriptor_pool(self.desc_pool, None);
         // Todas as pipelines da struct: a lista antiga cobria 8 das 31, e as outras só
         // morriam com o device.
         for p in [
@@ -6555,12 +6468,10 @@ impl Drop for ResidentForward<'_> {
             &self.dn_l2_qk,
             &self.gate_quant,
         ] {
-            // SAFETY: handles criados por nós, ordem inversa.
-            unsafe {
-                d.destroy_pipeline(p.pipeline, None);
-                d.destroy_pipeline_layout(p.layout, None);
-                d.destroy_descriptor_set_layout(p.desc_set_layout, None);
-            }
+            // handles criados por nós, ordem inversa.
+            d.destroy_pipeline(p.pipeline, None);
+            d.destroy_pipeline_layout(p.layout, None);
+            d.destroy_descriptor_set_layout(p.desc_set_layout, None);
         }
     }
 }

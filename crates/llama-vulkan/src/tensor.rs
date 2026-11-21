@@ -142,13 +142,10 @@ impl GpuTensor {
         let staging_mem = alloc_and_bind_cached(ctx, phys, d, staging_buf)?;
 
         // 2. map -> copy -> unmap
-        unsafe {
-            // SAFETY: staging_mem foi alocada host-visible com tamanho `size`;
-            // o ponteiro retornado e valido ate unmap_memory.
-            let ptr = d.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())?;
-            std::ptr::copy_nonoverlapping(repacked.as_ptr(), ptr as *mut u8, repacked.len());
-            d.unmap_memory(staging_mem);
-        }
+        // staging_mem foi alocada host-visible com tamanho `size`.
+        d.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())?
+            .escrever(&repacked);
+        d.unmap_memory(staging_mem);
 
         // 3. Device-local buffer
         let device_buf = create_buf(
@@ -162,13 +159,10 @@ impl GpuTensor {
         one_shot_copy(d, dev.queue, dev.cmd_pool, staging_buf, device_buf, size)?;
 
         // 5. Destroi staging
-        unsafe {
-            // SAFETY: staging_buf e staging_mem foram criados por nos nesta funcao;
-            // a copia ja foi concluida (one_shot_copy faz fence wait).
-            d.destroy_buffer(staging_buf, None);
-            d.free_memory(staging_mem, None);
-        }
-
+        // staging_buf e staging_mem foram criados por nos nesta funcao;
+        // a copia ja foi concluida (one_shot_copy faz fence wait).
+        d.destroy_buffer(staging_buf, None);
+        d.free_memory(staging_mem, None);
         Ok(Self {
             buffer: device_buf,
             memory: device_mem,
@@ -179,14 +173,12 @@ impl GpuTensor {
     }
 
     /// Libera os recursos Vulkan. Deve ser chamado antes de dropar.
-    pub fn destroy(self, dev: &ash::Device) {
-        unsafe {
-            // SAFETY: dev e valido; buffer e memory foram criados por este device.
-            dev.destroy_buffer(self.buffer, None);
-            dev.free_memory(self.memory, None);
-        }
+    pub fn destroy(self, dev: &crate::ffi::Device) {
+        // dev e valido; buffer e memory foram criados por este device.
+        dev.destroy_buffer(self.buffer, None);
+        dev.free_memory(self.memory, None);
         // Impede que Drop emita warning: os recursos ja foram liberados acima.
-        // SAFETY: nao ha outros recursos a liberar alem de buffer e memory, ja feitos.
+        // nao ha outros recursos a liberar alem de buffer e memory, ja feitos.
         std::mem::forget(self);
     }
 }
@@ -208,7 +200,7 @@ impl Drop for GpuTensor {
 
 /// Cria um VkBuffer com os usage flags especificados.
 pub(crate) fn create_buf(
-    dev: &ash::Device,
+    dev: &crate::ffi::Device,
     size: vk::DeviceSize,
     usage: vk::BufferUsageFlags,
 ) -> Result<vk::Buffer, vk::Result> {
@@ -218,8 +210,8 @@ pub(crate) fn create_buf(
         sharing_mode: vk::SharingMode::EXCLUSIVE,
         ..Default::default()
     };
-    // SAFETY: dev e valido; info foi construido com valores corretos.
-    unsafe { dev.create_buffer(&info, None) }
+    // dev e valido; info foi construido com valores corretos.
+    dev.create_buffer(&info, None)
 }
 
 /// Aloca e faz bind de memoria para um buffer.
@@ -229,7 +221,7 @@ pub(crate) fn create_buf(
 pub(crate) fn alloc_and_bind(
     ctx: &VulkanContext,
     phys: &VulkanPhysicalDevice,
-    dev: &ash::Device,
+    dev: &crate::ffi::Device,
     buf: vk::Buffer,
     host_visible: bool,
 ) -> Result<vk::DeviceMemory, vk::Result> {
@@ -250,7 +242,7 @@ pub(crate) fn alloc_and_bind(
 pub(crate) fn alloc_and_bind_cached(
     ctx: &VulkanContext,
     phys: &VulkanPhysicalDevice,
-    dev: &ash::Device,
+    dev: &crate::ffi::Device,
     buf: vk::Buffer,
 ) -> Result<vk::DeviceMemory, vk::Result> {
     let cached = vk::MemoryPropertyFlags::HOST_VISIBLE
@@ -265,18 +257,17 @@ pub(crate) fn alloc_and_bind_cached(
 fn alloc_with_flags(
     ctx: &VulkanContext,
     phys: &VulkanPhysicalDevice,
-    dev: &ash::Device,
+    dev: &crate::ffi::Device,
     buf: vk::Buffer,
     required_flags: vk::MemoryPropertyFlags,
 ) -> Result<vk::DeviceMemory, vk::Result> {
-    // SAFETY: ctx.instance e phys.handle sao validos.
-    let mem_props = unsafe {
-        ctx.instance
-            .get_physical_device_memory_properties(phys.handle)
-    };
+    // ctx.instance e phys.handle sao validos.
+    let mem_props = ctx
+        .instance
+        .get_physical_device_memory_properties(phys.handle);
 
-    // SAFETY: dev e valido; buf foi criado com sucesso pelo caller.
-    let mem_reqs = unsafe { dev.get_buffer_memory_requirements(buf) };
+    // dev e valido; buf foi criado com sucesso pelo caller.
+    let mem_reqs = dev.get_buffer_memory_requirements(buf);
 
     let mem_type_idx = (0..mem_props.memory_type_count)
         .find(|&i| {
@@ -295,14 +286,14 @@ fn alloc_with_flags(
         ..Default::default()
     };
 
-    // SAFETY: dev e valido; alloc_info tem mem_type_idx verificado acima.
-    let memory = unsafe { dev.allocate_memory(&alloc_info, None)? };
+    // dev e valido; alloc_info tem mem_type_idx verificado acima.
+    let memory = dev.allocate_memory(&alloc_info, None)?;
 
-    // SAFETY: buf e memory foram criados pelo mesmo device; offset 0 e valido.
-    if let Err(e) = unsafe { dev.bind_buffer_memory(buf, memory, 0) } {
+    // buf e memory foram criados pelo mesmo device; offset 0 e valido.
+    if let Err(e) = dev.bind_buffer_memory(buf, memory, 0) {
         // Quem chama só recebe o erro, sem a memória: liberá-la aqui ou ela sobra.
-        // SAFETY: memory acabou de ser alocada e não está ligada a nada.
-        unsafe { dev.free_memory(memory, None) };
+        // memory acabou de ser alocada e não está ligada a nada.
+        dev.free_memory(memory, None);
         return Err(e);
     }
 
@@ -311,7 +302,7 @@ fn alloc_with_flags(
 
 /// Copia `src` para `dst` via command buffer one-shot com fence wait.
 pub(crate) fn one_shot_copy(
-    dev: &ash::Device,
+    dev: &crate::ffi::Device,
     queue: vk::Queue,
     pool: vk::CommandPool,
     src: vk::Buffer,
@@ -325,8 +316,8 @@ pub(crate) fn one_shot_copy(
         command_buffer_count: 1,
         ..Default::default()
     };
-    // SAFETY: dev e valido; pool foi criado por este device.
-    let cmd_bufs = unsafe { dev.allocate_command_buffers(&alloc_info)? };
+    // dev e valido; pool foi criado por este device.
+    let cmd_bufs = dev.allocate_command_buffers(&alloc_info)?;
     let cmd = cmd_bufs[0];
 
     // Grava copia
@@ -334,26 +325,23 @@ pub(crate) fn one_shot_copy(
         flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
         ..Default::default()
     };
-    unsafe {
-        // SAFETY: cmd e valido e recém alocado.
-        dev.begin_command_buffer(cmd, &begin_info)?;
+    // cmd e valido e recém alocado.
+    dev.begin_command_buffer(cmd, &begin_info)?;
 
-        let copy_region = vk::BufferCopy {
-            src_offset: 0,
-            dst_offset: 0,
-            size,
-        };
-        // SAFETY: src, dst e cmd sao handles validos.
-        dev.cmd_copy_buffer(cmd, src, dst, &[copy_region]);
+    let copy_region = vk::BufferCopy {
+        src_offset: 0,
+        dst_offset: 0,
+        size,
+    };
+    // src, dst e cmd sao handles validos.
+    dev.cmd_copy_buffer(cmd, src, dst, &[copy_region]);
 
-        // SAFETY: cmd foi gravado com sucesso.
-        dev.end_command_buffer(cmd)?;
-    }
-
+    // cmd foi gravado com sucesso.
+    dev.end_command_buffer(cmd)?;
     // Submete com fence para sincronizar
     let fence_info = vk::FenceCreateInfo::default();
-    // SAFETY: dev e valido.
-    let fence = unsafe { dev.create_fence(&fence_info, None)? };
+    // dev e valido.
+    let fence = dev.create_fence(&fence_info, None)?;
 
     let submit_info = vk::SubmitInfo {
         command_buffer_count: 1,
@@ -361,25 +349,22 @@ pub(crate) fn one_shot_copy(
         ..Default::default()
     };
 
-    // SAFETY: queue, fence e submit_info sao validos.
-    let submit_res = unsafe { dev.queue_submit(queue, &[submit_info], fence) };
+    // queue, fence e submit_info sao validos.
+    let submit_res = dev.queue_submit(queue, &[submit_info], fence);
 
     // So espera se o submit teve sucesso; caso contrario a fence nunca foi sinalizada.
-    // SAFETY: fence foi criada por nos; timeout u64::MAX garante espera completa.
+    // fence foi criada por nos; timeout u64::MAX garante espera completa.
     let wait_res = if submit_res.is_ok() {
-        unsafe { dev.wait_for_fences(&[fence], true, u64::MAX) }
+        dev.wait_for_fences(&[fence], true, u64::MAX)
     } else {
         Ok(())
     };
 
     // Cleanup garantido em todos os paths (sucesso ou erro).
-    unsafe {
-        // SAFETY: fence foi criada por nos nesta funcao e nao sera mais usada.
-        dev.destroy_fence(fence, None);
-        // SAFETY: cmd foi alocado de pool pelo mesmo device nesta funcao.
-        dev.free_command_buffers(pool, &[cmd]);
-    }
-
+    // fence foi criada por nos nesta funcao e nao sera mais usada.
+    dev.destroy_fence(fence, None);
+    // cmd foi alocado de pool pelo mesmo device nesta funcao.
+    dev.free_command_buffers(pool, &[cmd]);
     submit_res?;
     wait_res?;
     Ok(())
@@ -453,7 +438,7 @@ fn transformar(ty: gguf::GgmlType, src: &[u8], dst: &mut [u8]) {
 struct Lote {
     staging: vk::Buffer,
     mem: vk::DeviceMemory,
-    ptr: *mut u8,
+    mapa: crate::ffi::Mapa,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     /// Submetido e ainda não esperado.
@@ -477,7 +462,7 @@ struct Lote {
 /// A memória do staging é write-combining: escrita sequencial voa, releitura é desastrosa
 /// — por isso cada byte é escrito uma vez só, em ordem crescente, e nada é lido de volta.
 pub struct Uploader<'d> {
-    dev: &'d ash::Device,
+    dev: &'d crate::ffi::Device,
     queue: vk::Queue,
     pool: vk::CommandPool,
     mem: GpuAllocator,
@@ -523,8 +508,8 @@ impl<'d> Uploader<'d> {
             command_buffer_count: 2,
             ..Default::default()
         };
-        // SAFETY: device e pool válidos; o pool tem RESET_COMMAND_BUFFER.
-        let cmds = unsafe { d.allocate_command_buffers(&info)? };
+        // device e pool válidos; o pool tem RESET_COMMAND_BUFFER.
+        let cmds = d.allocate_command_buffers(&info)?;
         let (Some(&c0), Some(&c1)) = (cmds.first(), cmds.get(1)) else {
             return Err(TensorError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED));
         };
@@ -550,7 +535,7 @@ impl<'d> Uploader<'d> {
     fn novo_lote(
         ctx: &VulkanContext,
         phys: &VulkanPhysicalDevice,
-        d: &ash::Device,
+        d: &crate::ffi::Device,
         cmd: vk::CommandBuffer,
         staging_bytes: vk::DeviceSize,
     ) -> Result<Lote, TensorError> {
@@ -558,18 +543,15 @@ impl<'d> Uploader<'d> {
         // Host-visible sem HOST_CACHED: aqui só se escreve, e write-combining é o tipo
         // certo para isso — o cacheado só se paga quando a CPU lê de volta.
         let mem = alloc_and_bind(ctx, phys, d, staging, true)?;
-        // SAFETY: memória host-visible recém-criada com esse tamanho; o mapa vive até
+        // Memória host-visible recém-criada com esse tamanho; o mapa vive até
         // `finalizar` e nunca é remapeado.
-        let ptr = unsafe {
-            d.map_memory(mem, 0, staging_bytes, vk::MemoryMapFlags::empty())?
-                .cast::<u8>()
-        };
-        // SAFETY: device válido.
-        let fence = unsafe { d.create_fence(&vk::FenceCreateInfo::default(), None)? };
+        let mapa = d.map_memory(mem, 0, staging_bytes, vk::MemoryMapFlags::empty())?;
+        // device válido.
+        let fence = d.create_fence(&vk::FenceCreateInfo::default(), None)?;
         Ok(Lote {
             staging,
             mem,
-            ptr,
+            mapa,
             cmd,
             fence,
             voando: false,
@@ -660,21 +642,19 @@ impl<'d> Uploader<'d> {
             let l = &mut self.lotes[i];
             if l.voando {
                 let _fase = llama_model::perfil_carga::Fase::nova(nome);
-                // SAFETY: fence criada por nós, submetida com este cmd.
-                unsafe { d.wait_for_fences(&[l.fence], true, u64::MAX)? };
+                // fence criada por nós, submetida com este cmd.
+                d.wait_for_fences(&[l.fence], true, u64::MAX)?;
                 l.voando = false;
             }
         }
-        // SAFETY: nada mais em voo; todos os handles foram criados por nós.
-        unsafe {
-            for l in &self.lotes {
-                d.unmap_memory(l.mem);
-                d.destroy_buffer(l.staging, None);
-                d.free_memory(l.mem, None);
-                d.destroy_fence(l.fence, None);
-            }
-            d.free_command_buffers(self.pool, &[self.lotes[0].cmd, self.lotes[1].cmd]);
+        // nada mais em voo; todos os handles foram criados por nós.
+        for l in &self.lotes {
+            d.unmap_memory(l.mem);
+            d.destroy_buffer(l.staging, None);
+            d.free_memory(l.mem, None);
+            d.destroy_fence(l.fence, None);
         }
+        d.free_command_buffers(self.pool, &[self.lotes[0].cmd, self.lotes[1].cmd]);
         Ok(self.mem)
     }
 
@@ -686,15 +666,15 @@ impl<'d> Uploader<'d> {
             total,
             vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
         )?;
-        // SAFETY: buffer recém-criado por este device.
-        let reqs = unsafe { d.get_buffer_memory_requirements(buffer) };
+        // buffer recém-criado por este device.
+        let reqs = d.get_buffer_memory_requirements(buffer);
         // O alocador alinha os offsets em 256 e fixou o tipo de memória em `new`; se o
         // buffer pedir algo que isso não satisfaz, falhar é melhor que um bind inválido.
         if !256u64.is_multiple_of(reqs.alignment)
             || reqs.memory_type_bits & (1u32 << self.mem.mem_type_idx()) == 0
         {
-            // SAFETY: buffer criado logo acima e ainda sem bind.
-            unsafe { d.destroy_buffer(buffer, None) };
+            // buffer criado logo acima e ainda sem bind.
+            d.destroy_buffer(buffer, None);
             return Err(TensorError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
         }
         let alloc = self
@@ -705,18 +685,16 @@ impl<'d> Uploader<'d> {
             .mem
             .memoria(&alloc)
             .ok_or(TensorError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY))?;
-        // SAFETY: buffer e memória do mesmo device; offset alinhado e dentro do chunk.
-        unsafe { d.bind_buffer_memory(buffer, memoria, alloc.offset)? };
+        // buffer e memória do mesmo device; offset alinhado e dentro do chunk.
+        d.bind_buffer_memory(buffer, memoria, alloc.offset)?;
         Ok(buffer)
     }
 
     /// Fatia do staging do lote atual. O lote não está em voo — `preparar` esperou o fence
     /// dele —, então a CPU é a única dona desses bytes.
     fn staging_mut(&mut self, off: vk::DeviceSize, n: usize) -> &mut [u8] {
-        let ptr = self.lotes[self.atual].ptr;
-        // SAFETY: `off + n <= staging_bytes` porque quem chama só escreve o que reservou;
-        // a memória está mapeada desde `new` e é exclusiva deste lote.
-        unsafe { std::slice::from_raw_parts_mut(ptr.add(off as usize), n) }
+        let off = off as usize;
+        &mut self.lotes[self.atual].mapa.bytes_mut()[off..off + n]
     }
 
     /// Acrescenta uma cópia staging → destino ao command buffer do lote atual.
@@ -734,9 +712,9 @@ impl<'d> Uploader<'d> {
         };
         let d = self.dev;
         let l = &mut self.lotes[self.atual];
-        // SAFETY: cmd em gravação (aberto em `preparar`); buffers vivos; as faixas cabem
+        // cmd em gravação (aberto em `preparar`); buffers vivos; as faixas cabem
         // no tamanho de cada um.
-        unsafe { d.cmd_copy_buffer(l.cmd, l.staging, dst, &[regiao]) };
+        d.cmd_copy_buffer(l.cmd, l.staging, dst, &[regiao]);
         l.sujo = true;
     }
 
@@ -762,12 +740,10 @@ impl<'d> Uploader<'d> {
             p_command_buffers: &l.cmd,
             ..Default::default()
         };
-        // SAFETY: cmd gravado nesta thread e fechado agora; fence e fila deste device.
-        unsafe {
-            d.end_command_buffer(l.cmd)?;
-            d.reset_fences(&[l.fence])?;
-            d.queue_submit(queue, &[submit], l.fence)?;
-        }
+        // cmd gravado nesta thread e fechado agora; fence e fila deste device.
+        d.end_command_buffer(l.cmd)?;
+        d.reset_fences(&[l.fence])?;
+        d.queue_submit(queue, &[submit], l.fence)?;
         l.voando = true;
         l.sujo = false;
         Ok(())
@@ -780,19 +756,17 @@ impl<'d> Uploader<'d> {
         let l = &mut self.lotes[i];
         if l.voando {
             let _fase = llama_model::perfil_carga::Fase::nova(nome);
-            // SAFETY: fence criada por nós e submetida com este cmd.
-            unsafe { d.wait_for_fences(&[l.fence], true, u64::MAX)? };
+            // fence criada por nós e submetida com este cmd.
+            d.wait_for_fences(&[l.fence], true, u64::MAX)?;
             l.voando = false;
         }
         let begin = vk::CommandBufferBeginInfo {
             flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
             ..Default::default()
         };
-        // SAFETY: cmd fora de voo (fence esperada acima); pool com RESET_COMMAND_BUFFER.
-        unsafe {
-            d.reset_command_buffer(l.cmd, vk::CommandBufferResetFlags::empty())?;
-            d.begin_command_buffer(l.cmd, &begin)?;
-        }
+        // cmd fora de voo (fence esperada acima); pool com RESET_COMMAND_BUFFER.
+        d.reset_command_buffer(l.cmd, vk::CommandBufferResetFlags::empty())?;
+        d.begin_command_buffer(l.cmd, &begin)?;
         Ok(())
     }
 }
@@ -869,17 +843,15 @@ mod tests {
         let host = create_buf(d, size, vk::BufferUsageFlags::TRANSFER_DST).unwrap();
         let mem = alloc_and_bind_cached(ctx, phys, d, host).unwrap();
         one_shot_copy(d, dev.queue, dev.cmd_pool, buf, host, size).unwrap();
-        // SAFETY: memória host-visible cacheada, do tamanho pedido, sem uso concorrente.
-        unsafe {
-            let ptr = d
-                .map_memory(mem, 0, size, vk::MemoryMapFlags::empty())
-                .unwrap();
-            let v = std::slice::from_raw_parts(ptr.cast::<u8>(), n).to_vec();
-            d.unmap_memory(mem);
-            d.destroy_buffer(host, None);
-            d.free_memory(mem, None);
-            v
-        }
+        // Memória host-visible cacheada, do tamanho pedido, sem uso concorrente.
+        let v = d
+            .map_memory(mem, 0, size, vk::MemoryMapFlags::empty())
+            .unwrap()
+            .ler::<u8>(n);
+        d.unmap_memory(mem);
+        d.destroy_buffer(host, None);
+        d.free_memory(mem, None);
+        v
     }
 
     /// O que a GPU recebe tem de ser byte a byte o repack de referência, inclusive quando

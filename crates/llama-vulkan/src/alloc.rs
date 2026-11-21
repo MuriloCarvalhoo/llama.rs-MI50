@@ -58,12 +58,10 @@ impl GpuAllocator {
         _dev: &VulkanDevice,
         total_bytes: vk::DeviceSize,
     ) -> Result<Self, AllocError> {
-        let mem_props = unsafe {
-            // SAFETY: ctx.instance e phys.handle sao validos — criados e verificados
+        let mem_props = // ctx.instance e phys.handle sao validos — criados e verificados
             // em VulkanContext::new antes de chegar aqui.
             ctx.instance
-                .get_physical_device_memory_properties(phys.handle)
-        };
+                .get_physical_device_memory_properties(phys.handle);
         let mem_type_idx = (0..mem_props.memory_type_count)
             .find(|&i| {
                 mem_props.memory_types[i as usize]
@@ -93,7 +91,7 @@ impl GpuAllocator {
     /// Aloca `size` bytes alinhados a 256. Cria novo chunk se necessario.
     pub fn alloc(
         &mut self,
-        dev: &ash::Device,
+        dev: &crate::ffi::Device,
         size: vk::DeviceSize,
     ) -> Result<Allocation, AllocError> {
         let size = align_up(size, 256);
@@ -119,12 +117,10 @@ impl GpuAllocator {
             memory_type_index: self.mem_type_idx,
             ..Default::default()
         };
-        let memory = unsafe {
-            // SAFETY: dev e valido; alloc_info foi construido com mem_type_idx
+        let memory = // dev e valido; alloc_info foi construido com mem_type_idx
             // verificado em new() via get_physical_device_memory_properties.
             dev.allocate_memory(&alloc_info, None)
-                .map_err(AllocError::Oom)?
-        };
+                .map_err(AllocError::Oom)?;
         let idx = self.chunks.len();
         self.chunks.push(Chunk {
             memory,
@@ -142,10 +138,10 @@ impl GpuAllocator {
     pub fn free(&mut self, _alloc: Allocation) {}
 
     /// Libera todos os chunks. Deve ser chamado antes de dropar o alocador.
-    pub fn cleanup(&mut self, dev: &ash::Device) {
+    pub fn cleanup(&mut self, dev: &crate::ffi::Device) {
         for chunk in self.chunks.drain(..) {
-            // SAFETY: dev e valido; chunk.memory foi alocado por este device em alloc()
-            unsafe { dev.free_memory(chunk.memory, None) };
+            // dev e valido; chunk.memory foi alocado por este device em alloc()
+            dev.free_memory(chunk.memory, None);
         }
     }
 }

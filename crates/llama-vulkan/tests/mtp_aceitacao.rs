@@ -19,10 +19,8 @@ const MODELO: &str = "../../models/Qwen3.8-27B-Q4_K_M.gguf";
 /// Tokens gerados. Cada proposta custa ~1,3 GB de dequant na CPU, então mantém baixo.
 const N_TOKENS: usize = 24;
 
-#[allow(unsafe_code)]
-fn mapear() -> Option<memmap2::Mmap> {
-    let file = std::fs::File::open(Path::new(MODELO)).ok()?;
-    unsafe { memmap2::Mmap::map(&file) }.ok()
+fn mapear() -> Option<llama_sys::Mmap> {
+    llama_sys::mapear(Path::new(MODELO)).ok()
 }
 
 fn argmax(v: &[f32]) -> u32 {
@@ -37,7 +35,7 @@ fn argmax(v: &[f32]) -> u32 {
 
 /// Tudo o que os dois testes precisam do modelo real, ou `None` para pular.
 struct Cenario {
-    bytes: memmap2::Mmap,
+    bytes: llama_sys::Mmap,
 }
 
 impl Cenario {

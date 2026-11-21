@@ -4,6 +4,7 @@
 //! duas GPUs inteiras: paralelizar requisições só disputaria a mesma banda de memória.
 //! As outras esperam numa fila curta, e `/health` responde durante a geração — ver
 //! `servidor.rs`.
+#![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 
@@ -165,10 +166,7 @@ fn servir(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let bind = args.endereco();
     let modelo = args.model.as_ref().ok_or("falta -m/--model")?;
 
-    // SAFETY: mapeamento read-only de um arquivo tratado como imutável enquanto o
-    // servidor roda — mesma premissa do mmap do llama.cpp e do llama-cli.
-    #[allow(unsafe_code)]
-    let bytes = unsafe { memmap2::Mmap::map(&std::fs::File::open(modelo)?) }?;
+    let bytes = llama_sys::mapear(modelo)?;
     let f = gguf::GgufFile::parse(&bytes)?;
     let mut cfg = llama_model::LlamaConfig::from_gguf(&f)?;
     cfg.ctx = cfg.ctx.min(args.ctx);

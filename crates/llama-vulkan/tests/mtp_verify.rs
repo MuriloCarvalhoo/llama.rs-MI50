@@ -18,10 +18,8 @@ use llama_vulkan::{DnPipe, ResidentForward, VulkanContext};
 
 const MODELO: &str = "../../models/Qwen3.8-27B-Q4_K_M.gguf";
 
-#[allow(unsafe_code)]
-fn mapear() -> Option<memmap2::Mmap> {
-    let file = std::fs::File::open(Path::new(MODELO)).ok()?;
-    unsafe { memmap2::Mmap::map(&file) }.ok()
+fn mapear() -> Option<llama_sys::Mmap> {
+    llama_sys::mapear(Path::new(MODELO)).ok()
 }
 
 fn argmax(v: &[f32]) -> u32 {
@@ -46,14 +44,12 @@ fn pseudo(n: usize, semente: usize) -> Vec<f32> {
 }
 
 /// Bytes de um push constant qualquer.
-fn push_bytes<T: Copy>(p: &T) -> Vec<u8> {
-    let n = std::mem::size_of::<T>();
-    // SAFETY: T é POD (struct de u32/f32 repr(C)); lemos exatamente o seu tamanho.
-    unsafe { std::slice::from_raw_parts(std::ptr::from_ref(p).cast::<u8>(), n) }.to_vec()
+fn push_bytes<T: bytemuck::Pod>(p: &T) -> Vec<u8> {
+    bytemuck::bytes_of(p).to_vec()
 }
 
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
-#[derive(Clone, Copy)]
 struct PushDelta {
     d: u32,
     n_heads: u32,

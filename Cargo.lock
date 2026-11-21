@@ -98,6 +98,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "bytemuck"
+version = "1.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a1f896587b6f2c069c73d2f0913e2d590c3990285cd2f0b6aa02b786b4c679c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -400,9 +420,9 @@ dependencies = [
  "gguf",
  "llama-model",
  "llama-sampling",
+ "llama-sys",
  "llama-tokenizer",
  "llama-vulkan",
- "memmap2",
  "rand 0.10.2",
  "rayon",
  "thiserror",
@@ -418,11 +438,13 @@ dependencies = [
  "gguf",
  "half",
  "llama-sampling",
+ "llama-sys",
  "llama-tokenizer",
- "memmap2",
  "rand 0.10.2",
  "rayon",
+ "safe_arch",
  "thiserror",
+ "wide",
 ]
 
 [[package]]
@@ -442,12 +464,20 @@ dependencies = [
  "llama-chat",
  "llama-model",
  "llama-sampling",
+ "llama-sys",
  "llama-tokenizer",
  "llama-vulkan",
- "memmap2",
  "rand 0.10.2",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "llama-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "memmap2",
 ]
 
 [[package]]
@@ -455,7 +485,7 @@ name = "llama-tokenizer"
 version = "0.1.0"
 dependencies = [
  "gguf",
- "memmap2",
+ "llama-sys",
  "regex",
  "serde_json",
  "thiserror",
@@ -466,14 +496,15 @@ name = "llama-vulkan"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "bytemuck",
  "ggml-cpu",
  "gguf",
  "half",
  "libc",
  "llama-model",
  "llama-sampling",
+ "llama-sys",
  "llama-tokenizer",
- "memmap2",
  "rand 0.10.2",
  "rayon",
  "shaderc",
@@ -737,6 +768,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "safe_arch"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42c6efa15875e6ecb39ca61fb0b0c1a40b84fac5a5ffe71eef7d1000c8eb3f5f"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -963,6 +1003,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
 dependencies = [
  "wit-bindgen",
+]
+
+[[package]]
+name = "wide"
+version = "1.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d920ac99c3c8edce110cb8d07dbb324d6d026011dce85b1e9355b70f0adacc4f"
+dependencies = [
+ "bytemuck",
+ "safe_arch",
 ]
 
 [[package]]
