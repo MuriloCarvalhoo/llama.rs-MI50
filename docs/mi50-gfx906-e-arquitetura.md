@@ -156,7 +156,7 @@ Numa conversa de vários turnos o motor refazia o prefill do contexto inteiro a 
 - Prefill ~1,85× mais lento que o llama.cpp HIP (171,9 contra 318 tok/s com 7,5k).
 - Um snapshot só por conversa: divergência **antes** dele refaz o prompt inteiro.
 - Perde quando o modelo cabe numa placa só.
-- Sem MoE: o Qwen3.8-35B-A3B não carrega.
+- MoE só com experts Q3_K ou IQ3_XXS (os tipos do Qwen3.8-35B-A3B APEX); prefill do MoE 2,4–3,3× atrás do llama.cpp.
 - Só AMD/wave64; sem NVIDIA, sem RDNA.
 - Sem visão, `logprobs`, `n > 1`, penalidades de repetição.
 - 48 das 65 camadas do qwen35 são delta-net, com estado recorrente: o KV de atenção volta atrás,

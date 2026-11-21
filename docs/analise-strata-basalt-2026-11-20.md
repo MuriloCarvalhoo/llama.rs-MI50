@@ -124,8 +124,8 @@ VRAM quando se joga. Hoje os 19 GB de pesos ficam residentes o tempo todo.
   836 GB/s medidos de HBM2. Num modelo denso o KV quente tem de ficar em VRAM. Só tente se medir.
 - **Tabela n-gram de 28,8 GB.** É um arquivo de dados no SSD, lido algumas linhas por token;
   `engine/src/ngram` só tem o leitor. É artefato do modelo, não técnica.
-- **Expert cache, tiers adaptativos, `resident-experts`, peer experts.** Tudo para MoE, que o
-  llama.rs não suporta.
+- **Expert cache, tiers adaptativos, `resident-experts`, peer experts.** Tudo para MoE com experts fora da VRAM; o
+  35B-A3B cabe inteiro nas duas MI50.
 - **Kernels fp8/fp4 e drafters DSpark/DFlash2.** Hardware e modelos específicos.
 
 ## Validação

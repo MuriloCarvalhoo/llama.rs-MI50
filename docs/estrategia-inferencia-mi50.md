@@ -151,7 +151,7 @@ Investigar essa anomalia é o proxy mais barato para "quanto vai custar o TP".
   explode por haver uma única compute queue ([issue #23126](https://github.com/ggml-org/llama.cpp/issues/23126)).
   Duas GPUs resolvem isso naturalmente.
 
-**Alternativa no llama.cpp: trocar para um MoE** (o llama.rs não suporta MoE). Dado medido:
+**Alternativa no llama.cpp: trocar para um MoE** (o llama.rs passou a rodar o Qwen3.8-35B-A3B em 2026-11-20, ver `benchmarks.md`). Dado medido:
 **Qwen3-Coder-30B-A3B Q4_K_M roda a 73.10 tok/s em 1× MI50**
 ([llama-bench](https://ahelpme.com/ai/llamacpp-ai/llama-bench-the-qwen3-coder-30b-a3b-and-amd-radeon-instinct-mi50-32gb/)).
 Em batch-1 o MoE lê só os experts ativos → modelo grande **e** decode rápido, cabendo em layer-split

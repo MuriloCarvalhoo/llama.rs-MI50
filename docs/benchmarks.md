@@ -21,6 +21,22 @@ sem MTP.
 Prefill: o llama.cpp é ~1,85× mais rápido (318 contra 171,9 tok/s com 7,5k, desde o bloco de
 256). O snapshot na fronteira do turno (`1769c35`) levou o TTFT com 30k de 387 s para 31,5 s.
 
+## Qwen3.8-35B-A3B (MoE, 256 experts, top-8), 2× MI50 layer-split (2026-11-20)
+
+`Qwen3.8-35B-A3B-Distill.APEX-I-MiniPlus-V2.1-Abliterated.gguf` (Q3_K + IQ3_XXS, 13,6 GiB),
+prompts de código (fontes Rust do repo), frio, 512 tokens gerados, 1 execução por ponto.
+O llama.cpp é o build Vulkan `b3112-0c43822bf`, sem especulação.
+
+| Contexto | Prefill llama.rs | Prefill llama.cpp | Decode llama.rs | Decode llama.cpp |
+|---:|---:|---:|---:|---:|
+| 2k | 379 | 864 | **102,8** | 44,9 |
+| 8k | 340 | 1133 | **94,0** | 44,3 |
+| 16k | 286 | 1105 | **84,2** | 42,5 |
+| 30k | 224 | 937 | **71,1** | 39,7 |
+
+Saída conferida por teacher forcing contra o llama.cpp: top-1 igual em 47/48 (prompt curto)
+e 46/48 (2k), |Δ logprob| médio 0,02–0,06; as divergências são decisões apertadas.
+
 ## Qwen3.8-27B (híbrido atenção + gated delta-net), 2× MI50 layer-split
 
 | Config | tok/s |

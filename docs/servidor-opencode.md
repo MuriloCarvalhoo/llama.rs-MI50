@@ -92,6 +92,11 @@ No opencode, o provider aponta para o roteador e lista os nomes das seções:
   "name": "llama-rs router (local)",
   "options": { "baseURL": "http://127.0.0.1:8081/v1" },
   "models": {
+    "qwen3.8-35b-a3b": {
+      "name": "Qwen3.8-35B-A3B (llama-rs)",
+      "tool_call": true, "reasoning": true,
+      "limit": { "context": 131072, "output": 8192 }
+    },
     "qwen3.8-27b": {
       "name": "Qwen3.8-27B (llama-rs)",
       "tool_call": true, "reasoning": true,
