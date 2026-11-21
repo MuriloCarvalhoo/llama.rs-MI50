@@ -239,6 +239,55 @@ impl llama_model::GpuResidentDecode for LayerSplitForward<'_> {
         carry.ok_or_else(|| llama_model::ModelError::Gpu("nenhum shard".into()))
     }
 
+    /// Pipeline de duas GPUs: enquanto a segunda processa o bloco k, a primeira já roda o
+    /// k+1. Sequencial, cada GPU ficava parada a metade do prefill (medido no
+    /// Qwen3.8-35B-A3B: 131 + 203 ms por bloco de 256, um depois do outro).
+    fn prefill_blocos(
+        &self,
+        blocos: &[&[u32]],
+        pos0: usize,
+    ) -> Result<Vec<f32>, llama_model::ModelError> {
+        let [a, b] = self.shards.as_slice() else {
+            let mut logits = Vec::new();
+            let mut pos = pos0;
+            for bl in blocos {
+                logits = self.decode_batch(bl, pos)?;
+                pos += bl.len();
+            }
+            return Ok(logits);
+        };
+        let pos: Vec<usize> = blocos
+            .iter()
+            .scan(pos0, |p, bl| {
+                let ini = *p;
+                *p += bl.len();
+                Some(ini)
+            })
+            .collect();
+        let erro = |e: crate::matmul::MatmulError| {
+            a.aguardar_pendente();
+            b.aguardar_pendente();
+            llama_model::ModelError::Gpu(e.to_string())
+        };
+        let (Some(&primeiro), Some(&p0)) = (blocos.first(), pos.first()) else {
+            return Ok(Vec::new());
+        };
+        a.iniciar_lote(primeiro, p0, None).map_err(erro)?;
+        for k in 0..blocos.len() {
+            let h = a.concluir_lote(pos[k], blocos[k].len()).map_err(erro)?;
+            if k > 0 {
+                // Só os logits do último bloco interessam.
+                b.concluir_lote(pos[k - 1], blocos[k - 1].len()).map_err(erro)?;
+            }
+            b.iniciar_lote(blocos[k], pos[k], Some(&h)).map_err(erro)?;
+            if let (Some(prox), Some(&pp)) = (blocos.get(k + 1), pos.get(k + 1)) {
+                a.iniciar_lote(prox, pp, None).map_err(erro)?;
+            }
+        }
+        let ultimo = blocos.len() - 1;
+        b.concluir_lote(pos[ultimo], blocos[ultimo].len()).map_err(erro)
+    }
+
     /// Todos os shards decidem o mesmo bloco (`batch_do_modelo` olha o modelo inteiro).
     fn batch_size(&self) -> usize {
         self.shards

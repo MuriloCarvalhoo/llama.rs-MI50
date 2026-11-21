@@ -456,6 +456,20 @@ pub trait GpuResidentDecode {
         }
         Ok(logits)
     }
+
+    /// Vários blocos de prefill seguidos, a partir de `pos0`; devolve os logits do último.
+    /// O padrão é um `decode_batch` depois do outro. O layer-split sobrescreve com um
+    /// pipeline entre as GPUs: a segunda processa o bloco k enquanto a primeira já roda o
+    /// k+1 — como o pipeline parallelism do llama.cpp com `-sm layer`.
+    fn prefill_blocos(&self, blocos: &[&[u32]], pos0: usize) -> Result<Vec<f32>, ModelError> {
+        let mut logits = Vec::new();
+        let mut pos = pos0;
+        for b in blocos {
+            logits = self.decode_batch(b, pos)?;
+            pos += b.len();
+        }
+        Ok(logits)
+    }
     /// Guarda o estado que não volta atrás sozinho (o recorrente das camadas lineares) e o
     /// comprimento do KV, para que uma divergência de prompt **depois** desta posição não
     /// custe reprocessar tudo. Um snapshot só: o novo sobrescreve o anterior.
@@ -793,15 +807,21 @@ pub(crate) fn prefill_residente(
     let mut hidden = 0usize;
     let mut tamanhos = vec![gpu.batch_size()];
     tamanhos.extend(gpu.tamanhos_resto());
+    // A lista inteira de blocos sai antes de qualquer um rodar: é ela que deixa o backend
+    // sobrepor um bloco ao seguinte (ver `prefill_blocos`).
+    let mut blocos: Vec<&[u32]> = Vec::new();
     for nb in tamanhos {
         while nb > 1 && ids.len() - pos >= nb && gpu.lote_cabe(pos, nb) {
             let Some(bloco) = ids.get(pos..pos + nb) else {
                 break;
             };
-            logits = gpu.decode_batch(bloco, pos)?;
+            blocos.push(bloco);
             pos += nb;
             hidden = nb - 1;
         }
+    }
+    if !blocos.is_empty() {
+        logits = gpu.prefill_blocos(&blocos, pos0)?;
     }
     for &t in ids.get(pos..).unwrap_or(&[]) {
         logits = gpu.decode(t, pos)?;

@@ -1264,6 +1264,10 @@ pub struct ResidentForward<'ctx> {
     pub(crate) state: Option<ResidentState<'ctx>>,
     /// Clock fixo enquanto houver geração (ver `pstate.rs`). Só no backend carregado.
     pstate: Option<crate::pstate::Pstate>,
+    /// Há um passo submetido e ainda não aguardado (entre `iniciar` e `concluir`).
+    em_voo: std::cell::Cell<bool>,
+    /// Quando o passo em voo foi submetido — só para o perfil de host.
+    t_submit: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 impl<'ctx> ResidentForward<'ctx> {
@@ -1686,6 +1690,8 @@ impl<'ctx> ResidentForward<'ctx> {
             desc_pool,
             state: None,
             pstate: None,
+            em_voo: std::cell::Cell::new(false),
+            t_submit: std::cell::Cell::new(None),
         })
     }
 
@@ -5722,6 +5728,48 @@ impl<'ctx> ResidentForward<'ctx> {
         Ok(out)
     }
 
+    /// Primeira metade de [`Self::decode_shard_batch`]: grava e submete o bloco e volta
+    /// sem esperar a GPU. [`Self::concluir_lote`] espera e lê a saída. Entre as duas, a
+    /// outra GPU do layer-split pode trabalhar em outro bloco.
+    pub fn iniciar_lote(
+        &self,
+        tokens: &[u32],
+        pos0: usize,
+        x_in: Option<&[f32]>,
+    ) -> Result<(), MatmulError> {
+        let n_tok = tokens.len();
+        let st = self
+            .state
+            .as_ref()
+            .ok_or(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?;
+        let largura_ok =
+            n_tok == st.cfg.n_batch || st.planos_resto.iter().any(|(n, _, _)| *n == n_tok);
+        if n_tok < 2 || !largura_ok || pos0 + n_tok > st.cfg.ctx {
+            return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+        }
+        self.iniciar(tokens, pos0 + n_tok - 1, x_in, Modo::Batch)
+    }
+
+    /// Segunda metade: espera o bloco submetido por [`Self::iniciar_lote`] e devolve a
+    /// saída do shard (logits no último, a stream residual nos demais).
+    pub fn concluir_lote(&self, pos0: usize, n_tok: usize) -> Result<Vec<f32>, MatmulError> {
+        let out = self.concluir(n_tok, Modo::Batch)?;
+        if let Some(st) = self.state.as_ref() {
+            *st.len.borrow_mut() = pos0 + n_tok;
+        }
+        Ok(out)
+    }
+
+    /// Espera o que estiver na GPU, se houver — para um erro no meio do pipeline não
+    /// deixar um command buffer em uso quando o próximo passo for regravá-lo.
+    pub fn aguardar_pendente(&self) {
+        if self.em_voo.replace(false)
+            && let Some(st) = self.state.as_ref()
+        {
+            let _ = self.espera_fence(st);
+        }
+    }
+
     /// Rótulos das ops do plano, na ordem de execução — para conferir a montagem.
     pub fn dbg_plano(&self) -> Vec<&'static str> {
         self.state
@@ -6039,6 +6087,18 @@ impl<'ctx> ResidentForward<'ctx> {
         x_in: Option<&[f32]>,
         modo: Modo,
     ) -> Result<Vec<f32>, MatmulError> {
+        self.iniciar(tokens, pos, x_in, modo)?;
+        self.concluir(tokens.len(), modo)
+    }
+
+    /// Grava o command buffer do passo e submete, sem esperar.
+    fn iniciar(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        x_in: Option<&[f32]>,
+        modo: Modo,
+    ) -> Result<(), MatmulError> {
         let st = self
             .state
             .as_ref()
@@ -6079,11 +6139,27 @@ impl<'ctx> ResidentForward<'ctx> {
             d.reset_fences(&[st.token_fence])?;
             d.queue_submit(dev.queue, &[submit], st.token_fence)?;
         }
-        self.espera_fence(st)?;
-        let t_sub = t1.elapsed();
+        self.em_voo.set(true);
+        self.t_submit.set(Some(t1));
+        if let Some(pf) = &st.prof {
+            pf.host.borrow_mut()[0] += t_rec.as_nanos() as u64;
+        }
+        Ok(())
+    }
+
+    /// Espera o passo submetido por [`Self::iniciar`] e lê a saída.
+    fn concluir(&self, n_tok: usize, modo: Modo) -> Result<Vec<f32>, MatmulError> {
+        let st = self
+            .state
+            .as_ref()
+            .ok_or(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?;
+        let espera = self.espera_fence(st);
+        self.em_voo.set(false);
+        espera?;
+        let t_sub = self.t_submit.take().map(|t| t.elapsed()).unwrap_or_default();
         let t2 = std::time::Instant::now();
         // O perfil do prefill acumula o bloco cheio; o do resto tem outra lista de ops.
-        if modo != Modo::Batch || tokens.len() == st.cfg.n_batch {
+        if modo != Modo::Batch || n_tok == st.cfg.n_batch {
             self.collect_prof(st, modo)?;
         }
 
@@ -6094,7 +6170,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 st.cfg.vocab
             }
         } else {
-            st.cfg.n_embd * tokens.len()
+            st.cfg.n_embd * n_tok
         };
         // O mapa é persistente (feito uma vez na construção): `vkMapMemory`/`vkUnmapMemory`
         // a cada token são dois ioctls no caminho crítico, e o vocabulário do 32B faz esse
@@ -6112,7 +6188,6 @@ impl<'ctx> ResidentForward<'ctx> {
         };
         if let Some(pf) = &st.prof {
             let mut h = pf.host.borrow_mut();
-            h[0] += t_rec.as_nanos() as u64;
             h[1] += t_sub.as_nanos() as u64;
             h[2] += t2.elapsed().as_nanos() as u64;
         }
